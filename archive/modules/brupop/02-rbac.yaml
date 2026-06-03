@@ -1,0 +1,107 @@
+---
+# brupop-controller ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: brupop-controller-service-account
+  namespace: brupop-bottlerocket-aws
+  labels:
+    app.kubernetes.io/name: brupop-controller
+    app.kubernetes.io/component: controller
+
+---
+# brupop-agent ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: brupop-agent-service-account
+  namespace: brupop-bottlerocket-aws
+  labels:
+    app.kubernetes.io/name: brupop-agent
+    app.kubernetes.io/component: agent
+
+---
+# Controller ClusterRole — needs to read nodes, cordon/drain them,
+# and manage BottlerocketShadow CRs across all namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: brupop-controller-role
+  labels:
+    app.kubernetes.io/name: brupop-controller
+rules:
+  - apiGroups: ["brupop.bottlerocket.aws"]
+    resources: ["bottlerocketshadows"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["brupop.bottlerocket.aws"]
+    resources: ["bottlerocketshadows/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: brupop-controller-rolebinding
+  labels:
+    app.kubernetes.io/name: brupop-controller
+subjects:
+  - kind: ServiceAccount
+    name: brupop-controller-service-account
+    namespace: brupop-bottlerocket-aws
+roleRef:
+  kind: ClusterRole
+  name: brupop-controller-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Agent ClusterRole — needs to create/update the BottlerocketShadow for its own node.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: brupop-agent-role
+  labels:
+    app.kubernetes.io/name: brupop-agent
+rules:
+  - apiGroups: ["brupop.bottlerocket.aws"]
+    resources: ["bottlerocketshadows"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["brupop.bottlerocket.aws"]
+    resources: ["bottlerocketshadows/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: brupop-agent-rolebinding
+  labels:
+    app.kubernetes.io/name: brupop-agent
+subjects:
+  - kind: ServiceAccount
+    name: brupop-agent-service-account
+    namespace: brupop-bottlerocket-aws
+roleRef:
+  kind: ClusterRole
+  name: brupop-agent-role
+  apiGroup: rbac.authorization.k8s.io

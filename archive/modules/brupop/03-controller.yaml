@@ -1,0 +1,105 @@
+---
+# BRUPOP Controller — orchestrates the rolling Bottlerocket update process.
+# Runs on system nodes (nodeAffinity: node-role=system). Uses a lease for
+# leader election so only one controller acts at a time.
+#
+# Tuning:
+#   MAX_CONCURRENT_UPDATE:   maximum nodes updating simultaneously (default 1)
+#   SCHEDULER_CRON_EXPRESSION: when to check for available updates (default: every 30 min)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: brupop-controller
+  namespace: brupop-bottlerocket-aws
+  labels:
+    app.kubernetes.io/name: brupop-controller
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/version: "0.3.4"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: brupop-controller
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: brupop-controller
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: brupop-controller-service-account
+      priorityClassName: system-cluster-critical
+
+      # Run on system nodes, not customer nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role
+                    operator: In
+                    values: ["system"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: brupop-controller
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: brupop-controller
+          image: public.ecr.aws/bottlerocket/bottlerocket-update-operator:v0.3.4
+          command: ["/controller"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Maximum number of nodes allowed to update at once.
+            # Set > 1 only if your workloads tolerate concurrent node reboots.
+            - name: MAX_CONCURRENT_UPDATE
+              value: "1"
+            # Cron schedule for checking update availability (UTC)
+            - name: SCHEDULER_CRON_EXPRESSION
+              value: "*/30 * * * *"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: [ALL]
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+---
+# PodDisruptionBudget ensures at least one controller replica is always running.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: brupop-controller-pdb
+  namespace: brupop-bottlerocket-aws
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: brupop-controller

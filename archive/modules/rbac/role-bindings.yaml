@@ -1,0 +1,65 @@
+---
+# RoleBindings for each tenant namespace.
+#
+# The Kubernetes group name (e.g. "tenant:customer1") is set by the EKS
+# Access Entry in cfn/main.yaml (KubernetesGroups field). When a user assumes
+# the corresponding IAM role and calls the cluster, they are authenticated as
+# a member of this group and this RoleBinding grants them tenant-editor access
+# scoped exclusively to their own namespace.
+#
+# Isolation guarantee:
+#   - customer1's IAM role → group "tenant:customer1" → edit rights in tenant-customer1 only
+#   - No cross-namespace permissions are granted anywhere in this file.
+
+# --- customer1 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor-binding
+  namespace: tenant-customer1
+  labels:
+    tenant: customer1
+subjects:
+  - kind: Group
+    name: "tenant:customer1"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# --- customer2 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor-binding
+  namespace: tenant-customer2
+  labels:
+    tenant: customer2
+subjects:
+  - kind: Group
+    name: "tenant:customer2"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# --- customer3 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor-binding
+  namespace: tenant-customer3
+  labels:
+    tenant: customer3
+subjects:
+  - kind: Group
+    name: "tenant:customer3"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io

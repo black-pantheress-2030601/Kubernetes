@@ -1,0 +1,117 @@
+---
+# BRUPOP Agent DaemonSet — runs on every Bottlerocket node.
+# The agent communicates with the local Bottlerocket API socket to:
+#   1. Report the running OS version and update availability
+#   2. Stage, perform, and confirm OS updates on behalf of the controller
+#
+# The agent mounts the Bottlerocket API socket from the host so it can
+# invoke host-level operations (stage update, perform update, reboot).
+# This requires privileged access to the host socket path only.
+#
+# Tolerations include ALL taints (operator: Exists) so the agent
+# can run on both system nodes and every customer node group.
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: brupop-agent
+  namespace: brupop-bottlerocket-aws
+  labels:
+    app.kubernetes.io/name: brupop-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/version: "0.3.4"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: brupop-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: "25%"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: brupop-agent
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: brupop-agent-service-account
+      hostNetwork: false
+      hostPID: false
+      priorityClassName: system-node-critical
+
+      # Must tolerate ALL taints so the agent runs on every node including
+      # customer-tainted nodes. This is intentional — the update agent is
+      # a platform concern, not a tenant concern.
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+        - operator: Exists
+          effect: PreferNoSchedule
+
+      # Bottlerocket-only: skip nodes without the updater interface label
+      nodeSelector:
+        bottlerocket.aws/updater-interface-version: "2.0.0"
+
+      initContainers:
+        # Waits for the Bottlerocket API socket to be ready before starting
+        - name: wait-for-socket
+          image: public.ecr.aws/bottlerocket/bottlerocket-update-operator:v0.3.4
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until [ -S /run/api.sock ]; do
+                echo "waiting for /run/api.sock..."; sleep 2;
+              done
+          volumeMounts:
+            - name: api-socket
+              mountPath: /run/api.sock
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+
+      containers:
+        - name: brupop-agent
+          image: public.ecr.aws/bottlerocket/bottlerocket-update-operator:v0.3.4
+          command: ["/agent"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BOTTLEROCKET_API_SOCKET
+              value: /run/api.sock
+          volumeMounts:
+            - name: api-socket
+              mountPath: /run/api.sock
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            # Must run as root to access the Bottlerocket API socket
+            runAsNonRoot: false
+            runAsUser: 0
+            capabilities:
+              drop: [ALL]
+
+      volumes:
+        - name: api-socket
+          hostPath:
+            path: /run/api.sock
+            type: Socket
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

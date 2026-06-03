@@ -1,0 +1,101 @@
+---
+# tenant-editor ClusterRole — least-privilege workload management scoped to
+# a single namespace via RoleBinding below.
+#
+# Hardening decisions vs the original:
+#   pods/exec    REMOVED  — shell access into containers; primary lateral-movement vector
+#   pods/log     READ-ONLY (get) — logs are audit trail; delete would destroy evidence
+#   events       READ-ONLY — audit trail; writable events enable false-flag injection
+#   serviceaccounts  READ-ONLY — write access enables token-based privilege escalation
+#   endpoints    READ-ONLY — discovery; no reason to write
+#   daemonsets   REMOVED  — schedules on every node in the cluster, crosses tenant boundary
+#   replicasets  READ-ONLY — managed by Deployment controller; direct write causes split-brain
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tenant-editor
+rules:
+
+  # --- Read-only: observability, audit trail, discovery ---
+  - apiGroups: [""]
+    resources: [pods/log, pods/status, events, endpoints]
+    verbs: [get, list, watch]
+
+  # --- Read-only: service accounts (needed to reference them, not create them) ---
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get, list, watch]
+
+  # --- Read-only: ReplicaSets (owned by Deployment; direct mutation causes drift) ---
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+
+  # --- Full workload management ---
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+---
+# Each RoleBinding scopes tenant-editor to one namespace only.
+# The Group name must match KubernetesGroups on the EKS Access Entry.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor
+  namespace: tenant-customer1
+subjects:
+  - kind: Group
+    name: "tenant:customer1"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor
+  namespace: tenant-customer2
+subjects:
+  - kind: Group
+    name: "tenant:customer2"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-editor
+  namespace: tenant-customer3
+subjects:
+  - kind: Group
+    name: "tenant:customer3"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: tenant-editor
+  apiGroup: rbac.authorization.k8s.io

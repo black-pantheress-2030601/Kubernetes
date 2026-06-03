@@ -1,0 +1,42 @@
+---
+# Tenant namespaces. Each tenant is fully isolated from others via
+# NetworkPolicy (default-deny across namespaces) and Kubernetes RBAC.
+# The namespace names here must match TenantRoleMapping.*.Namespace in cfn/main.yaml.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-customer1
+  labels:
+    tenant: customer1
+    isolation: strict
+    environment: production
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-customer2
+  labels:
+    tenant: customer2
+    isolation: strict
+    environment: production
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-customer3
+  labels:
+    tenant: customer3
+    isolation: strict
+    environment: production
+
+---
+# Shared observability namespace — read-only access from each tenant via NetworkPolicy
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    role: monitoring

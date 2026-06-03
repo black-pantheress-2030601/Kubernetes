@@ -1,0 +1,818 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EKS cluster with multi-tenant namespace isolation.
+  Self-managed Bottlerocket node groups (system + per-customer).
+  Nodes use public IPs so they reach ECR via the IGW — no NAT or VPC endpoints needed.
+  IAM Role-to-Namespace mapping is the Mappings.TenantRoleMapping table.
+  Kubernetes RBAC (namespaces + RoleBindings) is applied separately by deploy.sh.
+
+  NOTE: ClusterCertificateAuthority is NOT exported (base64 CA exceeds the 1024-char
+  CFN Output limit). Fetch it with:
+    aws eks describe-cluster --name <cluster> --query cluster.certificateAuthority.data
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster }
+        Parameters: [ClusterName, KubernetesVersion, PublicAccessCIDR]
+      - Label: { default: Existing Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id]
+      - Label: { default: Bottlerocket AMI }
+        Parameters: [BottlerocketAMIId]
+      - Label: { default: System Node Group }
+        Parameters: [SystemInstanceType, SystemNodeMinSize, SystemNodeMaxSize, SystemNodeDesiredSize, SystemVolumeSize]
+      - Label: { default: Customer 1 Node Group }
+        Parameters: [EnableCustomer1, Customer1Name, Customer1InstanceType, Customer1MinSize, Customer1MaxSize, Customer1DesiredSize, Customer1VolumeSize]
+      - Label: { default: Customer 2 Node Group }
+        Parameters: [EnableCustomer2, Customer2Name, Customer2InstanceType, Customer2MinSize, Customer2MaxSize, Customer2DesiredSize, Customer2VolumeSize]
+      - Label: { default: Customer 3 Node Group }
+        Parameters: [EnableCustomer3, Customer3Name, Customer3InstanceType, Customer3MinSize, Customer3MaxSize, Customer3DesiredSize, Customer3VolumeSize]
+      - Label: { default: Tenant IAM Roles (Access Entries) }
+        Parameters: [PlatformAdminRoleArn, Customer1RoleArn, Customer2RoleArn, Customer3RoleArn]
+
+Parameters:
+
+  ClusterName:
+    Type: String
+    Default: eks-multitenant
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.32"
+    AllowedValues: ["1.30", "1.31", "1.32"]
+
+  PublicAccessCIDR:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: CIDR allowed to reach the public EKS API endpoint.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  # Resolves the latest Bottlerocket AMI for the chosen k8s version at deploy time.
+  # Change the path prefix if you change KubernetesVersion or switch to arm64.
+  BottlerocketAMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/bottlerocket/aws-k8s-1.32/x86_64/latest/image_id
+
+  # --- System node group ---
+  SystemInstanceType:    { Type: String, Default: "m5.large" }
+  SystemNodeMinSize:     { Type: Number, Default: 2 }
+  SystemNodeMaxSize:     { Type: Number, Default: 6 }
+  SystemNodeDesiredSize: { Type: Number, Default: 2 }
+  SystemVolumeSize:      { Type: Number, Default: 30 }
+
+  # --- Customer 1 ---
+  EnableCustomer1:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  Customer1Name:         { Type: String, Default: "customer1" }
+  Customer1InstanceType: { Type: String, Default: "m5.xlarge" }
+  Customer1MinSize:      { Type: Number, Default: 0 }
+  Customer1MaxSize:      { Type: Number, Default: 10 }
+  Customer1DesiredSize:  { Type: Number, Default: 1 }
+  Customer1VolumeSize:   { Type: Number, Default: 50 }
+  Customer1RoleArn:
+    Type: String
+    Default: ""
+    Description: IAM Role ARN assumed by customer1 users. Leave blank to skip Access Entry.
+
+  # --- Customer 2 ---
+  EnableCustomer2:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  Customer2Name:         { Type: String, Default: "customer2" }
+  Customer2InstanceType: { Type: String, Default: "m5.xlarge" }
+  Customer2MinSize:      { Type: Number, Default: 0 }
+  Customer2MaxSize:      { Type: Number, Default: 10 }
+  Customer2DesiredSize:  { Type: Number, Default: 0 }
+  Customer2VolumeSize:   { Type: Number, Default: 50 }
+  Customer2RoleArn:      { Type: String, Default: "" }
+
+  # --- Customer 3 ---
+  EnableCustomer3:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  Customer3Name:         { Type: String, Default: "customer3" }
+  Customer3InstanceType: { Type: String, Default: "m5.xlarge" }
+  Customer3MinSize:      { Type: Number, Default: 0 }
+  Customer3MaxSize:      { Type: Number, Default: 10 }
+  Customer3DesiredSize:  { Type: Number, Default: 0 }
+  Customer3VolumeSize:   { Type: Number, Default: 50 }
+  Customer3RoleArn:      { Type: String, Default: "" }
+
+  # --- Platform admin ---
+  PlatformAdminRoleArn:
+    Type: String
+    Default: ""
+    Description: IAM Role ARN for platform admins (receives cluster-admin). Leave blank to skip.
+
+# ---------------------------------------------------------------------------
+# Mappings — authoritative Role-to-Namespace table.
+# KubernetesGroup must match KubernetesGroups on the corresponding Access Entry.
+# NodeTaintKey/Value drive the NoSchedule taint set in each customer Launch Template.
+# ---------------------------------------------------------------------------
+Mappings:
+  TenantRoleMapping:
+    customer1:
+      Namespace: "tenant-customer1"
+      KubernetesGroup: "tenant:customer1"
+      NodeTaintKey: "customer-id"
+      NodeTaintValue: "customer1"
+    customer2:
+      Namespace: "tenant-customer2"
+      KubernetesGroup: "tenant:customer2"
+      NodeTaintKey: "customer-id"
+      NodeTaintValue: "customer2"
+    customer3:
+      Namespace: "tenant-customer3"
+      KubernetesGroup: "tenant:customer3"
+      NodeTaintKey: "customer-id"
+      NodeTaintValue: "customer3"
+
+Conditions:
+  CreateCustomer1Resources: !Equals [!Ref EnableCustomer1, "true"]
+  CreateCustomer2Resources: !Equals [!Ref EnableCustomer2, "true"]
+  CreateCustomer3Resources: !Equals [!Ref EnableCustomer3, "true"]
+
+  HasPlatformAdmin: !Not [!Equals [!Ref PlatformAdminRoleArn, ""]]
+  HasCustomer1Role: !And
+    - !Condition CreateCustomer1Resources
+    - !Not [!Equals [!Ref Customer1RoleArn, ""]]
+  HasCustomer2Role: !And
+    - !Condition CreateCustomer2Resources
+    - !Not [!Equals [!Ref Customer2RoleArn, ""]]
+  HasCustomer3Role: !And
+    - !Condition CreateCustomer3Resources
+    - !Not [!Equals [!Ref Customer3RoleArn, ""]]
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  ClusterSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ClusterName} cluster SG"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-cluster-sg"
+
+  # Shared SG for all self-managed nodes. Self-referencing ingress allows
+  # pod-to-pod and kubelet traffic across nodes.
+  NodeGroupSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ClusterName} self-managed nodes"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nodegroup-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+
+  NodeGroupSGIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeGroupSG
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeGroupSG
+      Description: Node-to-node within the cluster
+
+  NodeGroupSGIngressFromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeGroupSG
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control-plane to kubelet and webhooks
+
+  NodeGroupSGIngress443FromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeGroupSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control-plane to node on 443
+
+  # =========================================================================
+  # IAM
+  # =========================================================================
+
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-nodegroup-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  NodeGroupInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ClusterName}-nodegroup-profile"
+      Roles: [!Ref NodeGroupRole]
+
+  # =========================================================================
+  # EKS Cluster
+  # =========================================================================
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        SecurityGroupIds:
+          - !Ref ClusterSG
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref PublicAccessCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+
+  # =========================================================================
+  # OIDC Provider — enables IRSA
+  # =========================================================================
+
+  OIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+
+  # =========================================================================
+  # Node Role Access Entry — must exist before any node boots and tries to join.
+  # EC2_LINUX type grants the NodeGroupRole the permissions to self-register.
+  # =========================================================================
+
+  NodeRoleAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !GetAtt NodeGroupRole.Arn
+      Type: EC2_LINUX
+
+  # =========================================================================
+  # EKS Managed Add-ons
+  # =========================================================================
+
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeRoleAccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeRoleAccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeRoleAccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  AddonEbsCsiDriver:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeRoleAccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  # =========================================================================
+  # System Node Group — Launch Template + ASG
+  #
+  # No taint: accepts platform workloads (BRUPOP, CoreDNS, controllers).
+  # Customer pods won't land here because customer nodes carry a NoSchedule
+  # taint that customer workloads must tolerate.
+  # =========================================================================
+
+  SystemLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-system-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref SystemInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeGroupInstanceProfile.Arn
+        # NetworkInterfaces is required to set AssociatePublicIpAddress —
+        # it is mutually exclusive with top-level SecurityGroupIds.
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt EKSCluster.ClusterSecurityGroupId
+              - !Ref NodeGroupSG
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref SystemVolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              [settings.kubernetes]
+              api-server = "${EKSCluster.Endpoint}"
+              cluster-name = "${ClusterName}"
+              cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+              [settings.kubernetes.node-labels]
+              "node-role" = "system"
+              "nodegroup-type" = "system"
+              "bottlerocket.aws/updater-interface-version" = "2.0.0"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-system"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: nodegroup-type
+                Value: system
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-system"
+
+  SystemASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NodeRoleAccessEntry
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT3M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-system"
+      MinSize: !Sub "${SystemNodeMinSize}"
+      MaxSize: !Sub "${SystemNodeMaxSize}"
+      DesiredCapacity: !Sub "${SystemNodeDesiredSize}"
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref SystemLaunchTemplate
+        Version: !GetAtt SystemLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-system"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: nodegroup-type
+          Value: system
+          PropagateAtLaunch: true
+
+  # =========================================================================
+  # Customer Node Groups — Launch Template + ASG per tenant
+  #
+  # Each group carries:
+  #   NoSchedule taint: customer-id=<name>:NoSchedule
+  #   Node label:       customer-id=<name>
+  #
+  # Pods targeting these nodes must declare:
+  #   tolerations:  [{key: customer-id, value: <name>, effect: NoSchedule}]
+  #   nodeAffinity: requiredDuringScheduling on customer-id=<name>
+  #
+  # Customers can also bring their own Bottlerocket EC2s using the same
+  # user-data pattern with matching customer-id label and taint.
+  # =========================================================================
+
+  Customer1LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateCustomer1Resources
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-${Customer1Name}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref Customer1InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeGroupInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt EKSCluster.ClusterSecurityGroupId
+              - !Ref NodeGroupSG
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref Customer1VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              [settings.kubernetes]
+              api-server = "${EKSCluster.Endpoint}"
+              cluster-name = "${ClusterName}"
+              cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+              [settings.kubernetes.node-labels]
+              "node-role" = "customer"
+              "nodegroup-type" = "customer"
+              "customer-id" = "${Customer1Name}"
+              "bottlerocket.aws/updater-interface-version" = "2.0.0"
+
+              [settings.kubernetes.node-taints]
+              "customer-id" = "${Customer1Name}:NoSchedule"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-${Customer1Name}"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer-id
+                Value: !Ref Customer1Name
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-${Customer1Name}"
+              - Key: customer-id
+                Value: !Ref Customer1Name
+
+  Customer1ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: CreateCustomer1Resources
+    DependsOn: NodeRoleAccessEntry
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT3M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-${Customer1Name}"
+      MinSize: !Sub "${Customer1MinSize}"
+      MaxSize: !Sub "${Customer1MaxSize}"
+      DesiredCapacity: !Sub "${Customer1DesiredSize}"
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Customer1LaunchTemplate
+        Version: !GetAtt Customer1LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-${Customer1Name}"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer-id
+          Value: !Ref Customer1Name
+          PropagateAtLaunch: true
+
+  Customer2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateCustomer2Resources
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-${Customer2Name}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref Customer2InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeGroupInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt EKSCluster.ClusterSecurityGroupId
+              - !Ref NodeGroupSG
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref Customer2VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              [settings.kubernetes]
+              api-server = "${EKSCluster.Endpoint}"
+              cluster-name = "${ClusterName}"
+              cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+              [settings.kubernetes.node-labels]
+              "node-role" = "customer"
+              "nodegroup-type" = "customer"
+              "customer-id" = "${Customer2Name}"
+              "bottlerocket.aws/updater-interface-version" = "2.0.0"
+
+              [settings.kubernetes.node-taints]
+              "customer-id" = "${Customer2Name}:NoSchedule"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-${Customer2Name}"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer-id
+                Value: !Ref Customer2Name
+          - ResourceType: volume
+            Tags:
+              - Key: customer-id
+                Value: !Ref Customer2Name
+
+  Customer2ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: CreateCustomer2Resources
+    DependsOn: NodeRoleAccessEntry
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT3M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-${Customer2Name}"
+      MinSize: !Sub "${Customer2MinSize}"
+      MaxSize: !Sub "${Customer2MaxSize}"
+      DesiredCapacity: !Sub "${Customer2DesiredSize}"
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Customer2LaunchTemplate
+        Version: !GetAtt Customer2LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-${Customer2Name}"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer-id
+          Value: !Ref Customer2Name
+          PropagateAtLaunch: true
+
+  Customer3LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateCustomer3Resources
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-${Customer3Name}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref Customer3InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeGroupInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt EKSCluster.ClusterSecurityGroupId
+              - !Ref NodeGroupSG
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref Customer3VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              [settings.kubernetes]
+              api-server = "${EKSCluster.Endpoint}"
+              cluster-name = "${ClusterName}"
+              cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+              [settings.kubernetes.node-labels]
+              "node-role" = "customer"
+              "nodegroup-type" = "customer"
+              "customer-id" = "${Customer3Name}"
+              "bottlerocket.aws/updater-interface-version" = "2.0.0"
+
+              [settings.kubernetes.node-taints]
+              "customer-id" = "${Customer3Name}:NoSchedule"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-${Customer3Name}"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer-id
+                Value: !Ref Customer3Name
+          - ResourceType: volume
+            Tags:
+              - Key: customer-id
+                Value: !Ref Customer3Name
+
+  Customer3ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: CreateCustomer3Resources
+    DependsOn: NodeRoleAccessEntry
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT3M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-${Customer3Name}"
+      MinSize: !Sub "${Customer3MinSize}"
+      MaxSize: !Sub "${Customer3MaxSize}"
+      DesiredCapacity: !Sub "${Customer3DesiredSize}"
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Customer3LaunchTemplate
+        Version: !GetAtt Customer3LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-${Customer3Name}"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer-id
+          Value: !Ref Customer3Name
+          PropagateAtLaunch: true
+
+  # =========================================================================
+  # EKS Access Entries — maps IAM Roles to Kubernetes groups.
+  # deploy.sh applies RoleBindings that scope those groups to their namespace.
+  # =========================================================================
+
+  PlatformAdminEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasPlatformAdmin
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !Ref PlatformAdminRoleArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  Customer1Entry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasCustomer1Role
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !Ref Customer1RoleArn
+      Type: STANDARD
+      KubernetesGroups:
+        - !Sub "tenant:${Customer1Name}"
+
+  Customer2Entry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasCustomer2Role
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !Ref Customer2RoleArn
+      Type: STANDARD
+      KubernetesGroups:
+        - !Sub "tenant:${Customer2Name}"
+
+  Customer3Entry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasCustomer3Role
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !Ref Customer3RoleArn
+      Type: STANDARD
+      KubernetesGroups:
+        - !Sub "tenant:${Customer3Name}"
+
+Outputs:
+  ClusterName:
+    Value: !Ref EKSCluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+
+  ClusterEndpoint:
+    Value: !GetAtt EKSCluster.Endpoint
+    Export: { Name: !Sub "${AWS::StackName}-ClusterEndpoint" }
+
+  # CA intentionally omitted — base64 value exceeds the 1024-char CFN Output limit.
+  # Fetch: aws eks describe-cluster --name <cluster> --query cluster.certificateAuthority.data
+
+  OIDCProviderArn:
+    Value: !GetAtt OIDCProvider.Arn
+    Export: { Name: !Sub "${AWS::StackName}-OIDCProviderArn" }
+
+  OIDCIssuerUrl:
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export: { Name: !Sub "${AWS::StackName}-OIDCIssuerUrl" }
+
+  NodeGroupRoleArn:
+    Value: !GetAtt NodeGroupRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-NodeGroupRoleArn" }
+
+  SystemASGName:
+    Value: !Ref SystemASG
+    Export: { Name: !Sub "${AWS::StackName}-SystemASGName" }
+
+  Customer1Namespace:
+    Value: !FindInMap [TenantRoleMapping, customer1, Namespace]
+    Export: { Name: !Sub "${AWS::StackName}-Customer1Namespace" }
+
+  Customer2Namespace:
+    Value: !FindInMap [TenantRoleMapping, customer2, Namespace]
+    Export: { Name: !Sub "${AWS::StackName}-Customer2Namespace" }
+
+  Customer3Namespace:
+    Value: !FindInMap [TenantRoleMapping, customer3, Namespace]
+    Export: { Name: !Sub "${AWS::StackName}-Customer3Namespace" }

@@ -1,0 +1,137 @@
+---
+# Sample nginx deployment served from a private ECR repository.
+# Deployed into tenant-customer1 as a reference for how tenant workloads
+# should declare node affinity and tolerations to land on their dedicated nodes.
+#
+# Before applying, replace the image URI with your own ECR repository:
+#   <account-id>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
+#
+# The node group IAM role already has AmazonEC2ContainerRegistryReadOnly
+# attached, so ECR pull auth is handled automatically via the node's
+# instance profile — no imagePullSecrets required.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-sa
+  namespace: tenant-customer1
+  labels:
+    app: nginx
+    tenant: customer1
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: tenant-customer1
+  labels:
+    app: nginx
+    tenant: customer1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        tenant: customer1
+    spec:
+      serviceAccountName: nginx-sa
+
+      # Toleration — allow scheduling onto the customer1-tainted node group.
+      tolerations:
+        - key: customer-id
+          value: customer1
+          effect: NoSchedule
+
+      # Node affinity — require nodes labeled customer-id=customer1.
+      # Pods will ONLY land on the customer1 nodegroup.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: customer-id
+                    operator: In
+                    values:
+                      - customer1
+        # Spread pods across AZs within the customer1 node group
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: nginx
+                topologyKey: topology.kubernetes.io/zone
+
+      containers:
+        - name: nginx
+          image: 969341426174.dkr.ecr.ap-southeast-2.amazonaws.com/nginx:1.27.0-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: tenant-customer1
+  labels:
+    app: nginx
+    tenant: customer1
+spec:
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nginx-pdb
+  namespace: tenant-customer1
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: nginx

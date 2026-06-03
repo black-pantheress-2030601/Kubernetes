@@ -1,0 +1,1 @@
+Is this where you specify the Add-on configuration. Add the configuration for pods here too, we are going to deploy a nginx applicationm using private ECR repository.
