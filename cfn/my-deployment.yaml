@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters: 
+  ClusterName:
+    Type: String
+    Default: central-cluster
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+  KubernetesVersion:
+    Type: String
+    AllowedValues: ["1.30", "1.31", "1.32"]
+
+Resources:
+# ========================================================================
+# SECURITY GROUPS
+# ========================================================================
+
+ClusterSecurityGroup:
+  Type: AWS::EC2::SecurityGroup
+  Properties:
+    VpcId: !Ref VpcId
+    
+# ========================================================================
+# SHARED EKS CLUSTER 
+# ========================================================================
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref PublicAccessCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
