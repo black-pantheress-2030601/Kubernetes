@@ -1,0 +1,566 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Spoke account - Customer EKS cluster that connects to shared hub services.
+  Connects to: ECR (pull images), CloudWatch Logs, Amazon Managed Prometheus.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster Configuration }
+        Parameters: [ClusterName, CustomerName, KubernetesVersion]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id, PublicAccessCIDR]
+      - Label: { default: Node Configuration }
+        Parameters: [BottlerocketAMIId, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize, NodeVolumeSize]
+      - Label: { default: Hub Account Connection }
+        Parameters: [HubAccountId, HubECRRegion, HubLoggingRoleArn, HubPrometheusRoleArn, HubPrometheusEndpoint]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: customer1-prod
+
+  CustomerName:
+    Type: String
+    Default: customer1
+    Description: Customer identifier for tagging and labeling
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.32"
+    AllowedValues: ["1.30", "1.31", "1.32"]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PublicAccessCIDR:
+    Type: String
+    Default: "0.0.0.0/0"
+
+  BottlerocketAMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/bottlerocket/aws-k8s-1.32/x86_64/latest/image_id
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.large
+
+  NodeMinSize:
+    Type: Number
+    Default: 2
+
+  NodeMaxSize:
+    Type: Number
+    Default: 10
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 3
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 50
+
+  # Hub Account Connection Parameters
+  HubAccountId:
+    Type: String
+    Description: AWS Account ID of the hub account
+
+  HubECRRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region where hub ECR repositories exist
+
+  HubLoggingRoleArn:
+    Type: String
+    Default: ""
+    Description: ARN of cross-account logging role in hub account (optional)
+
+  HubPrometheusRoleArn:
+    Type: String
+    Default: ""
+    Description: ARN of cross-account Prometheus role in hub account (optional)
+
+  HubPrometheusEndpoint:
+    Type: String
+    Default: ""
+    Description: Amazon Managed Prometheus endpoint in hub account (optional)
+
+Conditions:
+  HasLoggingRole: !Not [!Equals [!Ref HubLoggingRoleArn, ""]]
+  HasPrometheusRole: !Not [!Equals [!Ref HubPrometheusRoleArn, ""]]
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ClusterName} cluster security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-cluster-sg"
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ClusterName} node security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-node-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow node to node communication
+
+  NodeSecurityGroupIngressFromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control plane to worker node communication
+
+  NodeSecurityGroupIngress443FromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control plane to worker node webhook
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # EBS CSI Driver permissions
+        - PolicyName: EBSCSIDriverPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribe
+                Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                  - ec2:ModifyVolume
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                Resource: "*"
+              - Sid: AllowTagging
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource:
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:snapshot/*"
+              - Sid: AllowVolumeCreation
+                Effect: Allow
+                Action:
+                  - ec2:CreateVolume
+                Resource: "*"
+              - Sid: AllowVolumeDeletion
+                Effect: Allow
+                Action:
+                  - ec2:DeleteVolume
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+        # Cross-account ECR pull from hub
+        - PolicyName: CrossAccountECRPull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                Resource:
+                  - !Sub "arn:aws:ecr:${HubECRRegion}:${HubAccountId}:repository/shared/*"
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ClusterName}-node-profile"
+      Roles: [!Ref NodeRole]
+
+  # IAM Role for FluentBit to assume hub logging role
+  FluentBitRole:
+    Type: AWS::IAM::Role
+    Condition: HasLoggingRole
+    Properties:
+      RoleName: !Sub "${ClusterName}-fluentbit-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: AssumeHubLoggingRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref HubLoggingRoleArn
+                Condition:
+                  StringEquals:
+                    sts:ExternalId: centralized-logging
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  # IAM Role for Prometheus to assume hub monitoring role
+  PrometheusRole:
+    Type: AWS::IAM::Role
+    Condition: HasPrometheusRole
+    Properties:
+      RoleName: !Sub "${ClusterName}-prometheus-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: AssumeHubPrometheusRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref HubPrometheusRoleArn
+                Condition:
+                  StringEquals:
+                    sts:ExternalId: centralized-monitoring
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  # =========================================================================
+  # EKS Cluster
+  # =========================================================================
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref PublicAccessCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+        - Key: hub-account
+          Value: !Ref HubAccountId
+
+  # =========================================================================
+  # EKS Add-ons
+  # =========================================================================
+
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  AddonEbsCsiDriver:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  AddonPodIdentity:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  # =========================================================================
+  # Pod Identity Associations
+  # =========================================================================
+
+  FluentBitPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: HasLoggingRole
+    Properties:
+      ClusterName: !Ref EKSCluster
+      Namespace: kube-system
+      ServiceAccount: fluent-bit
+      RoleArn: !GetAtt FluentBitRole.Arn
+
+  PrometheusPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: HasPrometheusRole
+    Properties:
+      ClusterName: !Ref EKSCluster
+      Namespace: monitoring
+      ServiceAccount: prometheus
+      RoleArn: !GetAtt PrometheusRole.Arn
+
+  # =========================================================================
+  # Launch Template
+  # =========================================================================
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-node-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref NodeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref NodeSecurityGroup
+            DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            [settings.kubernetes]
+            cluster-name = "${ClusterName}"
+            api-server = "${EKSCluster.Endpoint}"
+            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+
+            [settings.kubernetes.node-labels]
+            customer = "${CustomerName}"
+            cluster = "${ClusterName}"
+
+            [settings.kubernetes.node-taints]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+          - DeviceName: /dev/xvdb
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer
+                Value: !Ref CustomerName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-node-volume"
+              - Key: customer
+                Value: !Ref CustomerName
+
+  # =========================================================================
+  # Auto Scaling Group
+  # =========================================================================
+
+  NodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-node-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NodeMinSize
+      MaxSize: !Ref NodeMaxSize
+      DesiredCapacity: !Ref NodeDesiredSize
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-node"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer
+          Value: !Ref CustomerName
+          PropagateAtLaunch: true
+
+Outputs:
+  ClusterName:
+    Description: EKS cluster name
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-Endpoint"
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-Arn"
+
+  NodeRoleArn:
+    Description: Node IAM role ARN
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeRole"
+
+  FluentBitRoleArn:
+    Condition: HasLoggingRole
+    Description: FluentBit IAM role ARN for cross-account logging
+    Value: !GetAtt FluentBitRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FluentBitRole"
+
+  PrometheusRoleArn:
+    Condition: HasPrometheusRole
+    Description: Prometheus IAM role ARN for cross-account monitoring
+    Value: !GetAtt PrometheusRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PrometheusRole"
+
+  CustomerName:
+    Description: Customer identifier
+    Value: !Ref CustomerName
+    Export:
+      Name: !Sub "${AWS::StackName}-Customer"
+
+  HubAccountId:
+    Description: Hub account ID this cluster connects to
+    Value: !Ref HubAccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-HubAccount"

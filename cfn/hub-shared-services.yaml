@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Hub account - Shared services for multi-customer EKS architecture.
+  Provides: ECR registries, centralized logging, monitoring, and optional shared services cluster.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster Configuration }
+        Parameters: [ClusterName, KubernetesVersion, DeploySharedCluster]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id, PublicAccessCIDR]
+      - Label: { default: Node Configuration }
+        Parameters: [BottlerocketAMIId, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize]
+      - Label: { default: Customer Accounts }
+        Parameters: [Customer1AccountId, Customer2AccountId, Customer3AccountId]
+      - Label: { default: Shared Services }
+        Parameters: [EnableCentralizedLogging, EnableCentralizedMonitoring, EnablePrivateLink]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: shared-services-hub
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.32"
+    AllowedValues: ["1.30", "1.31", "1.32"]
+
+  DeploySharedCluster:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Deploy EKS cluster for shared services (ArgoCD, Grafana, etc.)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PublicAccessCIDR:
+    Type: String
+    Default: "0.0.0.0/0"
+
+  BottlerocketAMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/bottlerocket/aws-k8s-1.32/x86_64/latest/image_id
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.xlarge
+
+  NodeMinSize:
+    Type: Number
+    Default: 2
+
+  NodeMaxSize:
+    Type: Number
+    Default: 6
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 3
+
+  # Customer AWS Account IDs that can access shared resources
+  Customer1AccountId:
+    Type: String
+    Default: ""
+    Description: Customer 1 AWS Account ID (leave blank to skip)
+
+  Customer2AccountId:
+    Type: String
+    Default: ""
+    Description: Customer 2 AWS Account ID (leave blank to skip)
+
+  Customer3AccountId:
+    Type: String
+    Default: ""
+    Description: Customer 3 AWS Account ID (leave blank to skip)
+
+  EnableCentralizedLogging:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  EnableCentralizedMonitoring:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  EnablePrivateLink:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create VPC Endpoint Service for shared services
+
+Conditions:
+  DeployCluster: !Equals [!Ref DeploySharedCluster, "true"]
+  HasCustomer1: !Not [!Equals [!Ref Customer1AccountId, ""]]
+  HasCustomer2: !Not [!Equals [!Ref Customer2AccountId, ""]]
+  HasCustomer3: !Not [!Equals [!Ref Customer3AccountId, ""]]
+  EnableLogging: !Equals [!Ref EnableCentralizedLogging, "true"]
+  EnableMonitoring: !Equals [!Ref EnableCentralizedMonitoring, "true"]
+  EnablePL: !Equals [!Ref EnablePrivateLink, "true"]
+
+Resources:
+
+  # =========================================================================
+  # ECR - Container Registry (Shared across all customers)
+  # =========================================================================
+
+  SharedImagesRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: shared/images
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  SharedPlatformRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: shared/platform
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  # ECR Repository Policy - Allow customer accounts to pull images
+  SharedImagesRepositoryPolicy:
+    Type: AWS::ECR::RepositoryPolicy
+    Properties:
+      RepositoryName: !Ref SharedImagesRepository
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCustomerPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !If [HasCustomer1, !Sub "arn:aws:iam::${Customer1AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer2, !Sub "arn:aws:iam::${Customer2AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer3, !Sub "arn:aws:iam::${Customer3AccountId}:root", !Ref "AWS::NoValue"]
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+
+  SharedPlatformRepositoryPolicy:
+    Type: AWS::ECR::RepositoryPolicy
+    Properties:
+      RepositoryName: !Ref SharedPlatformRepository
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCustomerPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !If [HasCustomer1, !Sub "arn:aws:iam::${Customer1AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer2, !Sub "arn:aws:iam::${Customer2AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer3, !Sub "arn:aws:iam::${Customer3AccountId}:root", !Ref "AWS::NoValue"]
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+
+  # =========================================================================
+  # Centralized Logging - CloudWatch Logs
+  # =========================================================================
+
+  CentralizedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: /aws/eks/all-customers
+      RetentionInDays: 90
+
+  # IAM Role that customer accounts can assume to write logs
+  CrossAccountLoggingRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${ClusterName}-cross-account-logging"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !If [HasCustomer1, !Sub "arn:aws:iam::${Customer1AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer2, !Sub "arn:aws:iam::${Customer2AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer3, !Sub "arn:aws:iam::${Customer3AccountId}:root", !Ref "AWS::NoValue"]
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: centralized-logging
+      Policies:
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt CentralizedLogGroup.Arn
+                  - !Sub "${CentralizedLogGroup.Arn}:*"
+
+  # =========================================================================
+  # Centralized Monitoring - Amazon Managed Prometheus
+  # =========================================================================
+
+  PrometheusWorkspace:
+    Type: AWS::APS::Workspace
+    Condition: EnableMonitoring
+    Properties:
+      Alias: !Sub "${ClusterName}-prometheus"
+
+  # IAM Role for customer accounts to write metrics
+  CrossAccountPrometheusRole:
+    Type: AWS::IAM::Role
+    Condition: EnableMonitoring
+    Properties:
+      RoleName: !Sub "${ClusterName}-cross-account-prometheus"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !If [HasCustomer1, !Sub "arn:aws:iam::${Customer1AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer2, !Sub "arn:aws:iam::${Customer2AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer3, !Sub "arn:aws:iam::${Customer3AccountId}:root", !Ref "AWS::NoValue"]
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: centralized-monitoring
+      Policies:
+        - PolicyName: PrometheusRemoteWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aps:RemoteWrite
+                  - aps:QueryMetrics
+                  - aps:GetSeries
+                  - aps:GetLabels
+                  - aps:GetMetricMetadata
+                Resource: !GetAtt PrometheusWorkspace.Arn
+
+  # =========================================================================
+  # Optional: Shared Services EKS Cluster
+  # =========================================================================
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployCluster
+    Properties:
+      GroupDescription: !Sub "${ClusterName} cluster security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-cluster-sg"
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployCluster
+    Properties:
+      GroupDescription: !Sub "${ClusterName} node security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-node-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+
+  NodeSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployCluster
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow node to node communication
+
+  NodeSecurityGroupIngressFromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployCluster
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control plane to worker node communication
+
+  NodeSecurityGroupIngress443FromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployCluster
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
+      Description: Control plane to worker node webhook/admission
+
+  # IAM Roles
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Condition: DeployCluster
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Condition: DeployCluster
+    Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EBSCSIDriverPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribe
+                Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                  - ec2:ModifyVolume
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                Resource: "*"
+              - Sid: AllowTagging
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource:
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:snapshot/*"
+              - Sid: AllowVolumeCreation
+                Effect: Allow
+                Action:
+                  - ec2:CreateVolume
+                Resource: "*"
+              - Sid: AllowVolumeDeletion
+                Effect: Allow
+                Action:
+                  - ec2:DeleteVolume
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: DeployCluster
+    Properties:
+      InstanceProfileName: !Sub "${ClusterName}-node-profile"
+      Roles: [!Ref NodeRole]
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Condition: DeployCluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref PublicAccessCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+
+  # EKS Add-ons
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    Condition: DeployCluster
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    Condition: DeployCluster
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    Condition: DeployCluster
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  AddonEbsCsiDriver:
+    Type: AWS::EKS::Addon
+    Condition: DeployCluster
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  AddonPodIdentity:
+    Type: AWS::EKS::Addon
+    Condition: DeployCluster
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  # Launch Template
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: DeployCluster
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-node-lt"
+      LaunchTemplateData:
+        ImageId: !Ref BottlerocketAMIId
+        InstanceType: !Ref NodeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref NodeSecurityGroup
+            DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            [settings.kubernetes]
+            cluster-name = "${ClusterName}"
+            api-server = "${EKSCluster.Endpoint}"
+            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+          - DeviceName: /dev/xvdb
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+
+  # Auto Scaling Group
+  NodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: DeployCluster
+    Properties:
+      AutoScalingGroupName: !Sub "${ClusterName}-node-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NodeMinSize
+      MaxSize: !Ref NodeMaxSize
+      DesiredCapacity: !Ref NodeDesiredSize
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-node"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+
+  # =========================================================================
+  # S3 Bucket for Shared Artifacts
+  # =========================================================================
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ClusterName}-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCustomerRead
+            Effect: Allow
+            Principal:
+              AWS:
+                - !If [HasCustomer1, !Sub "arn:aws:iam::${Customer1AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer2, !Sub "arn:aws:iam::${Customer2AccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasCustomer3, !Sub "arn:aws:iam::${Customer3AccountId}:root", !Ref "AWS::NoValue"]
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+
+Outputs:
+  # ECR Outputs
+  SharedImagesRepositoryUri:
+    Description: URI of shared images ECR repository
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${SharedImagesRepository}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ECR-SharedImages"
+
+  SharedPlatformRepositoryUri:
+    Description: URI of shared platform ECR repository
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${SharedPlatformRepository}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ECR-SharedPlatform"
+
+  # Logging Outputs
+  CentralizedLogGroupName:
+    Condition: EnableLogging
+    Description: CloudWatch log group for all customers
+    Value: !Ref CentralizedLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+
+  CrossAccountLoggingRoleArn:
+    Condition: EnableLogging
+    Description: IAM role ARN for cross-account logging
+    Value: !GetAtt CrossAccountLoggingRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LoggingRole"
+
+  # Monitoring Outputs
+  PrometheusWorkspaceId:
+    Condition: EnableMonitoring
+    Description: Amazon Managed Prometheus workspace ID
+    Value: !Ref PrometheusWorkspace
+    Export:
+      Name: !Sub "${AWS::StackName}-PrometheusWorkspace"
+
+  PrometheusEndpoint:
+    Condition: EnableMonitoring
+    Description: Prometheus remote write endpoint
+    Value: !Sub "${PrometheusWorkspace.PrometheusEndpoint}api/v1/remote_write"
+    Export:
+      Name: !Sub "${AWS::StackName}-PrometheusEndpoint"
+
+  CrossAccountPrometheusRoleArn:
+    Condition: EnableMonitoring
+    Description: IAM role ARN for cross-account monitoring
+    Value: !GetAtt CrossAccountPrometheusRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PrometheusRole"
+
+  # Cluster Outputs (if deployed)
+  ClusterName:
+    Condition: DeployCluster
+    Description: EKS cluster name
+    Value: !Ref EKSCluster
+
+  ClusterEndpoint:
+    Condition: DeployCluster
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+
+  ClusterArn:
+    Condition: DeployCluster
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+
+  # Artifacts Bucket
+  ArtifactsBucketName:
+    Description: S3 bucket for shared artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucket"
