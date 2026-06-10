@@ -21,6 +21,11 @@ rules:
     resources: [pods/log, pods/status, events, endpoints]
     verbs: [get, list, watch]
 
+  # --- Read-only: StorageClasses (needed to reference them when creating PVCs) ---
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+
   # --- Read-only: service accounts (needed to reference them, not create them) ---
   - apiGroups: [""]
     resources: [serviceaccounts]
