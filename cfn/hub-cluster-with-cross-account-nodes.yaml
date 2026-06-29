@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Hub account - EKS cluster control plane that accepts nodegroups from spoke accounts.
+  The control plane lives here, nodes can be in hub or spoke accounts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster Configuration }
+        Parameters: [ClusterName, KubernetesVersion]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id, PublicAccessCIDR]
+      - Label: { default: Spoke Account Access }
+        Parameters: [SpokeAccount1Id, SpokeAccount2Id, SpokeAccount3Id]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: hub-shared-cluster
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.32"
+    AllowedValues: ["1.30", "1.31", "1.32"]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  PublicAccessCIDR:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: CIDR for public API access (for cross-account nodes)
+
+  # Spoke Account IDs that will run nodegroups
+  SpokeAccount1Id:
+    Type: String
+    Default: ""
+    Description: Spoke account 1 AWS Account ID (leave blank to skip)
+
+  SpokeAccount2Id:
+    Type: String
+    Default: ""
+    Description: Spoke account 2 AWS Account ID (leave blank to skip)
+
+  SpokeAccount3Id:
+    Type: String
+    Default: ""
+    Description: Spoke account 3 AWS Account ID (leave blank to skip)
+
+Conditions:
+  HasSpoke1: !Not [!Equals [!Ref SpokeAccount1Id, ""]]
+  HasSpoke2: !Not [!Equals [!Ref SpokeAccount2Id, ""]]
+  HasSpoke3: !Not [!Equals [!Ref SpokeAccount3Id, ""]]
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ClusterName} cluster security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-cluster-sg"
+
+  # Security group rules to allow spoke account nodes to reach control plane
+  # Note: Spoke nodes will create their own SGs and reference this SG ID
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # =========================================================================
+  # EKS Cluster
+  # =========================================================================
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref PublicAccessCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+
+  # =========================================================================
+  # EKS Add-ons
+  # =========================================================================
+
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  AddonEbsCsiDriver:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+
+  AddonPodIdentity:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+Outputs:
+  ClusterName:
+    Description: EKS cluster name
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint (pass to spoke stacks)
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-Endpoint"
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-Arn"
+
+  ClusterSecurityGroupId:
+    Description: Cluster security group ID (spoke nodes need this)
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterSecurityGroup"
+
+  ClusterCA:
+    Description: Cluster CA certificate (pass to spoke stacks)
+    Value: !GetAtt EKSCluster.CertificateAuthorityData
+    # Note: Cannot export - exceeds CloudFormation export limit of 1024 chars
+
+  Instructions:
+    Description: Next steps for adding spoke nodegroups
+    Value: !Sub |
+      For each spoke account nodegroup, after deploying the spoke stack:
+      1. Get the NodeRole ARN from spoke stack outputs
+      2. Create Access Entry: aws eks create-access-entry --cluster-name ${ClusterName} --principal-arn <SPOKE-NODE-ROLE-ARN> --type EC2_LINUX
+      3. Associate policy: aws eks associate-access-policy-association --cluster-name ${ClusterName} --principal-arn <SPOKE-NODE-ROLE-ARN> --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy --access-scope type=cluster
+      4. Update spoke node SG to allow traffic from this cluster SG: ${EKSCluster.ClusterSecurityGroupId}

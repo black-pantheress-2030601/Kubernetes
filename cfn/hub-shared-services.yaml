@@ -403,7 +403,7 @@ Resources:
                   - ec2:DeleteTags
                 Resource:
                   - !Sub "arn:aws:ec2:*:${AWS::AccountId}:volume/*"
-                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:snapshot/*"
+                  - !Sub " :aws:ec2:*:${AWS::AccountId}:snapshot/*"
               - Sid: AllowVolumeCreation
                 Effect: Allow
                 Action:
@@ -518,8 +518,7 @@ Resources:
           Fn::Base64: !Sub |
             [settings.kubernetes]
             cluster-name = "${ClusterName}"
-            api-server = "${EKSCluster.Endpoint}"
-            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+        sateAuthorityData}"
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:

@@ -1,37 +1,57 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Spoke account - Customer EKS cluster that connects to shared hub services.
-  Connects to: ECR (pull images), CloudWatch Logs, Amazon Managed Prometheus.
+  Spoke account - Nodegroup ONLY that joins a hub account EKS cluster.
+  The EKS control plane lives in the hub account.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      - Label: { default: Cluster Configuration }
-        Parameters: [ClusterName, CustomerName, KubernetesVersion]
+      - Label: { default: Hub Cluster Configuration }
+        Parameters: [HubAccountId, HubClusterName, HubClusterEndpoint, HubClusterCA, HubClusterSecurityGroupId]
       - Label: { default: Network }
-        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id, PublicAccessCIDR]
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id]
       - Label: { default: Node Configuration }
-        Parameters: [BottlerocketAMIId, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize, NodeVolumeSize]
-      - Label: { default: Hub Account Connection }
-        Parameters: [HubAccountId, HubECRRegion, HubLoggingRoleArn, HubPrometheusRoleArn, HubPrometheusEndpoint]
+        Parameters: [NodeGroupName, CustomerName, BottlerocketAMIId, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize, NodeVolumeSize]
+      - Label: { default: Hub Services }
+        Parameters: [HubECRRegion, HubLoggingRoleArn, HubPrometheusRoleArn]
 
 Parameters:
-  ClusterName:
+  # Hub Cluster Connection
+  HubAccountId:
     Type: String
-    Default: customer1-prod
+    Description: AWS Account ID where the EKS cluster control plane exists
+
+  HubClusterName:
+    Type: String
+    Description: Name of the EKS cluster in the hub account
+
+  HubClusterEndpoint:
+    Type: String
+    Description: EKS cluster API endpoint URL (e.g., https://ABC123.gr7.us-east-1.eks.amazonaws.com)
+
+  HubClusterCA:
+    Type: String
+    Description: Base64-encoded cluster CA certificate
+    NoEcho: true
+
+  HubClusterSecurityGroupId:
+    Type: String
+    Description: Security group ID of the hub EKS cluster (for node communication)
+
+  # Node Configuration
+  NodeGroupName:
+    Type: String
+    Default: customer1-nodes
+    Description: Name for this node group
 
   CustomerName:
     Type: String
     Default: customer1
-    Description: Customer identifier for tagging and labeling
-
-  KubernetesVersion:
-    Type: String
-    Default: "1.32"
-    AllowedValues: ["1.30", "1.31", "1.32"]
+    Description: Customer identifier for tagging
 
   VpcId:
     Type: AWS::EC2::VPC::Id
+    Description: VPC in spoke account (needs connectivity to hub cluster endpoint)
 
   Subnet1Id:
     Type: AWS::EC2::Subnet::Id
@@ -39,10 +59,6 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
   Subnet3Id:
     Type: AWS::EC2::Subnet::Id
-
-  PublicAccessCIDR:
-    Type: String
-    Default: "0.0.0.0/0"
 
   BottlerocketAMIId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -68,11 +84,7 @@ Parameters:
     Type: Number
     Default: 50
 
-  # Hub Account Connection Parameters
-  HubAccountId:
-    Type: String
-    Description: AWS Account ID of the hub account
-
+  # Hub Services
   HubECRRegion:
     Type: String
     Default: us-east-1
@@ -88,11 +100,6 @@ Parameters:
     Default: ""
     Description: ARN of cross-account Prometheus role in hub account (optional)
 
-  HubPrometheusEndpoint:
-    Type: String
-    Default: ""
-    Description: Amazon Managed Prometheus endpoint in hub account (optional)
-
 Conditions:
   HasLoggingRole: !Not [!Equals [!Ref HubLoggingRoleArn, ""]]
   HasPrometheusRole: !Not [!Equals [!Ref HubPrometheusRoleArn, ""]]
@@ -100,35 +107,21 @@ Conditions:
 Resources:
 
   # =========================================================================
-  # Security Groups
+  # Security Groups (Spoke Account)
   # =========================================================================
-
-  ClusterSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub "${ClusterName} cluster security group"
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: "0.0.0.0/0"
-      Tags:
-        - Key: Name
-          Value: !Sub "${ClusterName}-cluster-sg"
-        - Key: customer
-          Value: !Ref CustomerName
 
   NodeSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub "${ClusterName} node security group"
+      GroupDescription: !Sub "${NodeGroupName} security group"
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: "0.0.0.0/0"
       Tags:
         - Key: Name
-          Value: !Sub "${ClusterName}-node-sg"
-        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: !Sub "${NodeGroupName}-sg"
+        - Key: !Sub "kubernetes.io/cluster/${HubClusterName}"
           Value: owned
         - Key: customer
           Value: !Ref CustomerName
@@ -141,50 +134,36 @@ Resources:
       SourceSecurityGroupId: !Ref NodeSecurityGroup
       Description: Allow node to node communication
 
-  NodeSecurityGroupIngressFromCluster:
+  # Note: With public endpoint, hub control plane reaches nodes over internet
+  # Cross-account security group references don't work, so we allow all inbound on the ports
+  NodeSecurityGroupIngressFromInternet1025:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref NodeSecurityGroup
       IpProtocol: tcp
       FromPort: 1025
       ToPort: 65535
-      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
-      Description: Control plane to worker node communication
+      CidrIp: 0.0.0.0/0
+      Description: Allow control plane to worker node communication
 
-  NodeSecurityGroupIngress443FromCluster:
+  NodeSecurityGroupIngressFromInternet443:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref NodeSecurityGroup
       IpProtocol: tcp
       FromPort: 443
       ToPort: 443
-      SourceSecurityGroupId: !GetAtt EKSCluster.ClusterSecurityGroupId
-      Description: Control plane to worker node webhook
+      CidrIp: 0.0.0.0/0
+      Description: Allow control plane to worker node webhook
 
   # =========================================================================
-  # IAM Roles
+  # IAM Roles (Spoke Account)
   # =========================================================================
-
-  ClusterRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${ClusterName}-cluster-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: eks.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
-      Tags:
-        - Key: customer
-          Value: !Ref CustomerName
 
   NodeRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ClusterName}-node-role"
+      RoleName: !Sub "${NodeGroupName}-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -257,19 +236,21 @@ Resources:
       Tags:
         - Key: customer
           Value: !Ref CustomerName
+        - Key: hub-cluster
+          Value: !Ref HubClusterName
 
   NodeInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: !Sub "${ClusterName}-node-profile"
+      InstanceProfileName: !Sub "${NodeGroupName}-profile"
       Roles: [!Ref NodeRole]
 
-  # IAM Role for FluentBit to assume hub logging role
+  # IAM Role for FluentBit (optional)
   FluentBitRole:
     Type: AWS::IAM::Role
     Condition: HasLoggingRole
     Properties:
-      RoleName: !Sub "${ClusterName}-fluentbit-role"
+      RoleName: !Sub "${NodeGroupName}-fluentbit-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -294,12 +275,12 @@ Resources:
         - Key: customer
           Value: !Ref CustomerName
 
-  # IAM Role for Prometheus to assume hub monitoring role
+  # IAM Role for Prometheus (optional)
   PrometheusRole:
     Type: AWS::IAM::Role
     Condition: HasPrometheusRole
     Properties:
-      RoleName: !Sub "${ClusterName}-prometheus-role"
+      RoleName: !Sub "${NodeGroupName}-prometheus-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -325,136 +306,13 @@ Resources:
           Value: !Ref CustomerName
 
   # =========================================================================
-  # EKS Cluster
-  # =========================================================================
-
-  EKSCluster:
-    Type: AWS::EKS::Cluster
-    Properties:
-      Name: !Ref ClusterName
-      Version: !Ref KubernetesVersion
-      RoleArn: !GetAtt ClusterRole.Arn
-      ResourcesVpcConfig:
-        SubnetIds:
-          - !Ref Subnet1Id
-          - !Ref Subnet2Id
-          - !Ref Subnet3Id
-        SecurityGroupIds:
-          - !Ref ClusterSecurityGroup
-        EndpointPublicAccess: true
-        EndpointPrivateAccess: true
-        PublicAccessCidrs:
-          - !Ref PublicAccessCIDR
-      AccessConfig:
-        AuthenticationMode: API_AND_CONFIG_MAP
-        BootstrapClusterCreatorAdminPermissions: true
-      Logging:
-        ClusterLogging:
-          EnabledTypes:
-            - Type: api
-            - Type: audit
-      Tags:
-        - Key: customer
-          Value: !Ref CustomerName
-        - Key: hub-account
-          Value: !Ref HubAccountId
-
-  # =========================================================================
-  # EKS Add-ons
-  # =========================================================================
-
-  AddonVpcCni:
-    Type: AWS::EKS::Addon
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      AddonName: vpc-cni
-      ResolveConflicts: OVERWRITE
-
-  AddonCoreDns:
-    Type: AWS::EKS::Addon
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      AddonName: coredns
-      ResolveConflicts: OVERWRITE
-
-  AddonKubeProxy:
-    Type: AWS::EKS::Addon
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      AddonName: kube-proxy
-      ResolveConflicts: OVERWRITE
-
-  AddonEbsCsiDriver:
-    Type: AWS::EKS::Addon
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      AddonName: aws-ebs-csi-driver
-      ResolveConflicts: OVERWRITE
-
-  AddonPodIdentity:
-    Type: AWS::EKS::Addon
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      AddonName: eks-pod-identity-agent
-      ResolveConflicts: OVERWRITE
-
-  # =========================================================================
-  # Pod Identity Associations
-  # =========================================================================
-
-  FluentBitPodIdentity:
-    Type: AWS::EKS::PodIdentityAssociation
-    Condition: HasLoggingRole
-    Properties:
-      ClusterName: !Ref EKSCluster
-      Namespace: kube-system
-      ServiceAccount: fluent-bit
-      RoleArn: !GetAtt FluentBitRole.Arn
-
-  PrometheusPodIdentity:
-    Type: AWS::EKS::PodIdentityAssociation
-    Condition: HasPrometheusRole
-    Properties:
-      ClusterName: !Ref EKSCluster
-      Namespace: monitoring
-      ServiceAccount: prometheus
-      RoleArn: !GetAtt PrometheusRole.Arn
-
-  # =========================================================================
-  # EKS Access Entries (Modern node authentication)
-  # =========================================================================
-
-  NodeAccessEntry:
-    Type: AWS::EKS::AccessEntry
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      PrincipalArn: !GetAtt NodeRole.Arn
-      Type: EC2_LINUX
-
-  NodeAccessPolicy:
-    Type: AWS::EKS::AccessPolicyAssociation
-    DependsOn: NodeAccessEntry
-    Properties:
-      ClusterName: !Ref EKSCluster
-      PrincipalArn: !GetAtt NodeRole.Arn
-      PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy
-      AccessScope:
-        Type: cluster
-
-  # =========================================================================
   # Launch Template
   # =========================================================================
 
   NodeLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
-      LaunchTemplateName: !Sub "${ClusterName}-node-lt"
+      LaunchTemplateName: !Sub "${NodeGroupName}-lt"
       LaunchTemplateData:
         ImageId: !Ref BottlerocketAMIId
         InstanceType: !Ref NodeInstanceType
@@ -469,13 +327,14 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             [settings.kubernetes]
-            cluster-name = "${ClusterName}"
-            api-server = "${EKSCluster.Endpoint}"
-            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
+            cluster-name = "${HubClusterName}"
+            api-server = "${HubClusterEndpoint}"
+            cluster-certificate = "${HubClusterCA}"
 
             [settings.kubernetes.node-labels]
             customer = "${CustomerName}"
-            cluster = "${ClusterName}"
+            nodegroup = "${NodeGroupName}"
+            account = "${AWS::AccountId}"
 
             [settings.kubernetes.node-taints]
         BlockDeviceMappings:
@@ -495,15 +354,17 @@ Resources:
           - ResourceType: instance
             Tags:
               - Key: Name
-                Value: !Sub "${ClusterName}-node"
-              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: !Sub "${NodeGroupName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${HubClusterName}"
                 Value: owned
               - Key: customer
                 Value: !Ref CustomerName
+              - Key: hub-account
+                Value: !Ref HubAccountId
           - ResourceType: volume
             Tags:
               - Key: Name
-                Value: !Sub "${ClusterName}-node-volume"
+                Value: !Sub "${NodeGroupName}-volume"
               - Key: customer
                 Value: !Ref CustomerName
 
@@ -514,7 +375,7 @@ Resources:
   NodeAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      AutoScalingGroupName: !Sub "${ClusterName}-node-asg"
+      AutoScalingGroupName: !Sub "${NodeGroupName}-asg"
       LaunchTemplate:
         LaunchTemplateId: !Ref NodeLaunchTemplate
         Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
@@ -527,39 +388,42 @@ Resources:
         - !Ref Subnet3Id
       Tags:
         - Key: Name
-          Value: !Sub "${ClusterName}-node"
+          Value: !Sub "${NodeGroupName}-node"
           PropagateAtLaunch: true
-        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+        - Key: !Sub "kubernetes.io/cluster/${HubClusterName}"
           Value: owned
           PropagateAtLaunch: true
         - Key: customer
           Value: !Ref CustomerName
           PropagateAtLaunch: true
+        - Key: hub-account
+          Value: !Ref HubAccountId
+          PropagateAtLaunch: true
 
 Outputs:
-  ClusterName:
-    Description: EKS cluster name
-    Value: !Ref EKSCluster
+  NodeGroupName:
+    Description: Node group name
+    Value: !Ref NodeGroupName
     Export:
-      Name: !Sub "${AWS::StackName}-ClusterName"
-
-  ClusterEndpoint:
-    Description: EKS cluster endpoint
-    Value: !GetAtt EKSCluster.Endpoint
-    Export:
-      Name: !Sub "${AWS::StackName}-Endpoint"
-
-  ClusterArn:
-    Description: EKS cluster ARN
-    Value: !GetAtt EKSCluster.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-Arn"
+      Name: !Sub "${AWS::StackName}-NodeGroupName"
 
   NodeRoleArn:
-    Description: Node IAM role ARN
+    Description: Node IAM role ARN (add this to hub cluster Access Entries)
     Value: !GetAtt NodeRole.Arn
     Export:
       Name: !Sub "${AWS::StackName}-NodeRole"
+
+  NodeSecurityGroupId:
+    Description: Node security group ID
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeSecurityGroup"
+
+  AutoScalingGroupName:
+    Description: Auto scaling group name
+    Value: !Ref NodeAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASG"
 
   FluentBitRoleArn:
     Condition: HasLoggingRole
@@ -581,8 +445,9 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-Customer"
 
-  HubAccountId:
-    Description: Hub account ID this cluster connects to
-    Value: !Ref HubAccountId
-    Export:
-      Name: !Sub "${AWS::StackName}-HubAccount"
+  Instructions:
+    Description: Next steps
+    Value: !Sub |
+      1. In hub account, add Access Entry: aws eks create-access-entry --cluster-name ${HubClusterName} --principal-arn ${NodeRole.Arn} --type EC2_LINUX
+      2. Associate policy: aws eks associate-access-policy-association --cluster-name ${HubClusterName} --principal-arn ${NodeRole.Arn} --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy --access-scope type=cluster
+      3. Verify nodes: kubectl get nodes --selector=customer=${CustomerName}
