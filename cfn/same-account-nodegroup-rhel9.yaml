@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Same-account EKS nodegroup using RHEL 9.
+  This creates additional nodes in the SAME account as an existing EKS cluster.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing Cluster Configuration }
+        Parameters: [ClusterName, ClusterEndpoint, ClusterCA, ClusterSecurityGroupId]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id]
+      - Label: { default: Node Configuration }
+        Parameters: [NodeGroupName, CustomerName, RHEL9AMIId, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize, NodeVolumeSize]
+
+Parameters:
+  # Existing Cluster
+  ClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster
+    Default: hub-shared-cluster
+
+  ClusterEndpoint:
+    Type: String
+    Description: EKS cluster API endpoint URL
+
+  ClusterCA:
+    Type: String
+    Description: Base64-encoded cluster CA certificate
+    NoEcho: true
+
+  ClusterSecurityGroupId:
+    Type: String
+    Description: Security group ID of the EKS cluster
+
+  # Node Configuration
+  NodeGroupName:
+    Type: String
+    Default: customer1-rhel9-nodes
+    Description: Name for this node group
+
+  CustomerName:
+    Type: String
+    Default: customer1
+    Description: Customer identifier for tagging
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where cluster exists
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  RHEL9AMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/rhel/9/latest/x86_64/release/ami-id
+    Description: RHEL 9 AMI from AWS Systems Manager Parameter Store
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.large
+
+  NodeMinSize:
+    Type: Number
+    Default: 2
+
+  NodeMaxSize:
+    Type: Number
+    Default: 10
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 3
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 50
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${NodeGroupName} security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow node to node communication
+
+  NodeSecurityGroupIngressFromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ClusterSecurityGroupId
+      Description: Control plane to worker node communication
+
+  NodeSecurityGroupIngress443FromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ClusterSecurityGroupId
+      Description: Control plane to worker node webhook
+
+  # Allow cluster security group to reach these nodes
+  ClusterSecurityGroupIngressFromNodes:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Worker nodes to control plane communication
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NodeGroupName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # EBS CSI Driver permissions
+        - PolicyName: EBSCSIDriverPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribe
+                Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                  - ec2:ModifyVolume
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                Resource: "*"
+              - Sid: AllowTagging
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource:
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:snapshot/*"
+              - Sid: AllowVolumeCreation
+                Effect: Allow
+                Action:
+                  - ec2:CreateVolume
+                Resource: "*"
+              - Sid: AllowVolumeDeletion
+                Effect: Allow
+                Action:
+                  - ec2:DeleteVolume
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${NodeGroupName}-profile"
+      Roles: [!Ref NodeRole]
+
+  # =========================================================================
+  # Launch Template
+  # =========================================================================
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${NodeGroupName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref RHEL9AMIId
+        InstanceType: !Ref NodeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref NodeSecurityGroup
+            DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -o xtrace
+
+            # Update system
+            dnf update -y
+
+            # Install required packages
+            dnf install -y container-selinux
+
+            # Set up EKS binaries directory
+            mkdir -p /opt/eks
+            cd /opt/eks
+
+            # Download and install kubectl
+            KUBECTL_VERSION=1.32.0
+            curl -LO "https://dl.k8s.io/release/v$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/
+
+            # Download and extract EKS optimized binaries
+            K8S_VERSION=1.32.0
+            PLATFORM=linux/amd64
+
+            # Install containerd
+            dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            dnf install -y containerd.io
+
+            # Configure containerd
+            mkdir -p /etc/containerd
+            containerd config default > /etc/containerd/config.toml
+
+            # Enable systemd cgroup driver
+            sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+            # Start containerd
+            systemctl enable --now containerd
+
+            # Install CNI plugins
+            CNI_VERSION=v1.3.0
+            mkdir -p /opt/cni/bin
+            curl -L "https://github.com/containernetworking/plugins/releases/download/${!CNI_VERSION}/cni-plugins-linux-amd64-${!CNI_VERSION}.tgz" | tar -C /opt/cni/bin -xz
+
+            # Download kubelet and aws-iam-authenticator
+            curl -LO "https://dl.k8s.io/release/v${!K8S_VERSION}/bin/linux/amd64/kubelet"
+            chmod +x kubelet
+            mv kubelet /usr/local/bin/
+
+            curl -Lo aws-iam-authenticator https://github.com/kubernetes-sigs/aws-iam-authenticator/releases/download/v0.6.14/aws-iam-authenticator_0.6.14_linux_amd64
+            chmod +x aws-iam-authenticator
+            mv aws-iam-authenticator /usr/local/bin/
+
+            # Create kubelet config
+            mkdir -p /etc/kubernetes
+            cat > /etc/kubernetes/kubelet-config.json <<EOF
+            {
+              "kind": "KubeletConfiguration",
+              "apiVersion": "kubelet.config.k8s.io/v1beta1",
+              "address": "0.0.0.0",
+              "authentication": {
+                "anonymous": {
+                  "enabled": false
+                },
+                "webhook": {
+                  "cacheTTL": "2m0s",
+                  "enabled": true
+                },
+                "x509": {
+                  "clientCAFile": "/etc/kubernetes/pki/ca.crt"
+                }
+              },
+              "authorization": {
+                "mode": "Webhook",
+                "webhook": {
+                  "cacheAuthorizedTTL": "5m0s",
+                  "cacheUnauthorizedTTL": "30s"
+                }
+              },
+              "clusterDomain": "cluster.local",
+              "hairpinMode": "hairpin-veth",
+              "cgroupDriver": "systemd",
+              "clusterDNS": ["10.100.0.10"],
+              "resolvConf": "/etc/resolv.conf",
+              "runtimeRequestTimeout": "15m",
+              "tlsCertFile": "/var/lib/kubelet/pki/kubelet.crt",
+              "tlsPrivateKeyFile": "/var/lib/kubelet/pki/kubelet.key"
+            }
+            EOF
+
+            # Create CA certificate
+            mkdir -p /etc/kubernetes/pki
+            echo "${ClusterCA}" | base64 -d > /etc/kubernetes/pki/ca.crt
+
+            # Create kubeconfig
+            cat > /var/lib/kubelet/kubeconfig <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /etc/kubernetes/pki/ca.crt
+                server: ${ClusterEndpoint}
+              name: kubernetes
+            contexts:
+            - context:
+                cluster: kubernetes
+                user: kubelet
+              name: kubelet
+            current-context: kubelet
+            users:
+            - name: kubelet
+              user:
+                exec:
+                  apiVersion: client.authentication.k8s.io/v1beta1
+                  command: /usr/local/bin/aws-iam-authenticator
+                  args:
+                    - "token"
+                    - "-i"
+                    - "${ClusterName}"
+            EOF
+
+            # Create kubelet service
+            cat > /etc/systemd/system/kubelet.service <<EOF
+            [Unit]
+            Description=Kubernetes Kubelet
+            Documentation=https://kubernetes.io/docs/
+            After=containerd.service
+            Requires=containerd.service
+
+            [Service]
+            ExecStart=/usr/local/bin/kubelet \\
+              --config=/etc/kubernetes/kubelet-config.json \\
+              --kubeconfig=/var/lib/kubelet/kubeconfig \\
+              --container-runtime-endpoint=unix:///run/containerd/containerd.sock \\
+              --node-labels=customer=${CustomerName},nodegroup=${NodeGroupName} \\
+              --register-node=true \\
+              --v=2
+            Restart=on-failure
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            # Enable and start kubelet
+            systemctl daemon-reload
+            systemctl enable kubelet
+            systemctl start kubelet
+
+            # Signal completion
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NodeAutoScalingGroup --region ${AWS::Region}
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer
+                Value: !Ref CustomerName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-volume"
+              - Key: customer
+                Value: !Ref CustomerName
+
+  # =========================================================================
+  # Auto Scaling Group
+  # =========================================================================
+
+  NodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${NodeGroupName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NodeMinSize
+      MaxSize: !Ref NodeMaxSize
+      DesiredCapacity: !Ref NodeDesiredSize
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-node"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer
+          Value: !Ref CustomerName
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NodeDesiredSize
+        Timeout: PT15M
+
+Outputs:
+  NodeGroupName:
+    Description: Node group name
+    Value: !Ref NodeGroupName
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeGroupName"
+
+  NodeRoleArn:
+    Description: Node IAM role ARN
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeRole"
+
+  NodeSecurityGroupId:
+    Description: Node security group ID
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeSecurityGroup"
+
+  AutoScalingGroupName:
+    Description: Auto scaling group name
+    Value: !Ref NodeAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASG"
+
+  CustomerName:
+    Description: Customer identifier
+    Value: !Ref CustomerName
+    Export:
+      Name: !Sub "${AWS::StackName}-Customer"
+
+  NextSteps:
+    Description: Post-deployment steps
+    Value: !Sub |
+      1. Add node role to aws-auth ConfigMap:
+         kubectl edit configmap aws-auth -n kube-system
+
+         Add under mapRoles:
+         - rolearn: ${NodeRole.Arn}
+           username: system:node:{{EC2PrivateDNSName}}
+           groups:
+             - system:bootstrappers
+             - system:nodes
+
+      2. Verify nodes joined:
+         kubectl get nodes --selector=customer=${CustomerName}
