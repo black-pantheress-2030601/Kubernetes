@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Same-account self-managed EKS nodegroup using Amazon Linux 2 EKS-optimized AMI.
+  Simple and proven to work with EKS.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing Cluster Configuration }
+        Parameters: [ClusterName]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id]
+      - Label: { default: Node Configuration }
+        Parameters: [NodeGroupName, CustomerName, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize, NodeVolumeSize]
+
+Parameters:
+  # Existing Cluster
+  ClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster
+    Default: hub-shared-cluster
+
+  # Node Configuration
+  NodeGroupName:
+    Type: String
+    Default: customer1-al2-nodes
+    Description: Name for this node group
+
+  CustomerName:
+    Type: String
+    Default: customer1
+    Description: Customer identifier for tagging
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where cluster exists
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.large
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+
+  NodeMaxSize:
+    Type: Number
+    Default: 10
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 50
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${NodeGroupName} security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow node to node communication
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NodeGroupName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${NodeGroupName}-profile"
+      Roles: [!Ref NodeRole]
+
+  # =========================================================================
+  # Launch Template
+  # =========================================================================
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${NodeGroupName}-lt"
+      LaunchTemplateData:
+        # Use SSM parameter for latest EKS-optimized AL2 AMI for Kubernetes 1.32
+        ImageId: '{{resolve:ssm:/aws/service/eks/optimized-ami/1.32/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !Ref NodeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref NodeSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -o xtrace
+            /etc/eks/bootstrap.sh ${ClusterName} \
+              --kubelet-extra-args '--node-labels=customer=${CustomerName},nodegroup=${NodeGroupName}'
+            /opt/aws/bin/cfn-signal --exit-code $? \
+              --stack ${AWS::StackName} \
+              --resource NodeAutoScalingGroup \
+              --region ${AWS::Region}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer
+                Value: !Ref CustomerName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-volume"
+              - Key: customer
+                Value: !Ref CustomerName
+
+  # =========================================================================
+  # Auto Scaling Group
+  # =========================================================================
+
+  NodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${NodeGroupName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NodeMinSize
+      MaxSize: !Ref NodeMaxSize
+      DesiredCapacity: !Ref NodeDesiredSize
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-node"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer
+          Value: !Ref CustomerName
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NodeDesiredSize
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+Outputs:
+  NodeGroupName:
+    Description: Node group name
+    Value: !Ref NodeGroupName
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeGroupName"
+
+  NodeRoleArn:
+    Description: Node IAM role ARN
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeRole"
+
+  NodeSecurityGroupId:
+    Description: Node security group ID
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeSecurityGroup"
+
+  AutoScalingGroupName:
+    Description: Auto scaling group name
+    Value: !Ref NodeAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASG"
+
+  CustomerName:
+    Description: Customer identifier
+    Value: !Ref CustomerName
+    Export:
+      Name: !Sub "${AWS::StackName}-Customer"
+
+  PostDeploymentSteps:
+    Description: Steps to complete after deployment
+    Value: !Sub |
+      The nodes should automatically join the cluster!
+
+      Verify with:
+      1. kubectl get nodes --selector=customer=${CustomerName}
+      2. kubectl get nodes --show-labels
+
+      If nodes don't appear, add node role to aws-auth ConfigMap:
+      kubectl edit configmap aws-auth -n kube-system
+
+      Add under mapRoles:
+      - rolearn: ${NodeRole.Arn}
+        username: system:node:{{EC2PrivateDNSName}}
+        groups:
+          - system:bootstrappers
+          - system:nodes
