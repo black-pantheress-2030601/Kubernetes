@@ -426,26 +426,27 @@ Resources:
       RoleArn: !GetAtt PrometheusRole.Arn
 
   # =========================================================================
-  # EKS Access Entries (Modern node authentication)
+  # EKS Access Entries - Commented out, using aws-auth ConfigMap instead
+  # Note: AWS::EKS::AccessPolicyAssociation not available in all regions yet
   # =========================================================================
 
-  NodeAccessEntry:
-    Type: AWS::EKS::AccessEntry
-    DependsOn: EKSCluster
-    Properties:
-      ClusterName: !Ref EKSCluster
-      PrincipalArn: !GetAtt NodeRole.Arn
-      Type: EC2_LINUX
+  # NodeAccessEntry:
+  #   Type: AWS::EKS::AccessEntry
+  #   DependsOn: EKSCluster
+  #   Properties:
+  #     ClusterName: !Ref EKSCluster
+  #     PrincipalArn: !GetAtt NodeRole.Arn
+  #     Type: EC2_LINUX
 
-  NodeAccessPolicy:
-    Type: AWS::EKS::AccessPolicyAssociation
-    DependsOn: NodeAccessEntry
-    Properties:
-      ClusterName: !Ref EKSCluster
-      PrincipalArn: !GetAtt NodeRole.Arn
-      PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy
-      AccessScope:
-        Type: cluster
+  # NodeAccessPolicy:
+  #   Type: AWS::EKS::AccessPolicyAssociation
+  #   DependsOn: NodeAccessEntry
+  #   Properties:
+  #     ClusterName: !Ref EKSCluster
+  #     PrincipalArn: !GetAtt NodeRole.Arn
+  #     PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy
+  #     AccessScope:
+  #       Type: cluster
 
   # =========================================================================
   # Launch Template
