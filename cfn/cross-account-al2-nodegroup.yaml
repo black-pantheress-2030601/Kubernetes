@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cross-account self-managed EKS nodegroup using Amazon Linux 2.
+  Uses EKS Access Entries API instead of aws-auth ConfigMap to avoid cross-account EC2 query issues.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Hub Cluster Configuration }
+        Parameters: [HubAccountId, ClusterName, ClusterEndpoint, ClusterCA]
+      - Label: { default: Network }
+        Parameters: [VpcId, Subnet1Id, Subnet2Id, Subnet3Id]
+      - Label: { default: Node Configuration }
+        Parameters: [NodeGroupName, CustomerName, NodeInstanceType, NodeMinSize, NodeMaxSize, NodeDesiredSize]
+
+Parameters:
+  # Hub Cluster (in different account)
+  HubAccountId:
+    Type: String
+    Description: AWS account ID where the EKS cluster exists
+    Default: "969341426174"
+
+  ClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster in hub account
+    Default: hub-shared-cluster
+
+  ClusterEndpoint:
+    Type: String
+    Description: EKS cluster API endpoint
+    Default: https://1B6BB231450B3833F3D8146906ECFF5C.gr7.ap-southeast-2.eks.amazonaws.com
+
+  ClusterCA:
+    Type: String
+    Description: EKS cluster certificate authority data (base64)
+    NoEcho: true
+
+  # Node Configuration
+  NodeGroupName:
+    Type: String
+    Default: cross-account-al2-nodes
+    Description: Name for this node group
+
+  CustomerName:
+    Type: String
+    Default: customer1
+    Description: Customer identifier for tagging
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in spoke account (different from cluster VPC)
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.large
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+
+  NodeMaxSize:
+    Type: Number
+    Default: 10
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 50
+
+Resources:
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${NodeGroupName} security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-sg"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow node to node communication
+
+  # Allow all inbound since we can't reference cross-account cluster SG
+  NodeSecurityGroupIngressFromInternet443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Allow kubelet API from anywhere (cross-account)
+
+  NodeSecurityGroupIngressFromInternet1025:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      CidrIp: 0.0.0.0/0
+      Description: Allow node ports from anywhere (cross-account)
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NodeGroupName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: customer
+          Value: !Ref CustomerName
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${NodeGroupName}-profile"
+      Roles: [!Ref NodeRole]
+
+  # =========================================================================
+  # Launch Template
+  # =========================================================================
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${NodeGroupName}-lt"
+      LaunchTemplateData:
+        # Use SSM parameter for latest EKS-optimized AL2 AMI for Kubernetes 1.32
+        ImageId: '{{resolve:ssm:/aws/service/eks/optimized-ami/1.32/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !Ref NodeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NodeInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref NodeSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -o xtrace
+
+            # Bootstrap with cross-account cluster endpoint
+            /etc/eks/bootstrap.sh ${ClusterName} \
+              --b64-cluster-ca ${ClusterCA} \
+              --apiserver-endpoint ${ClusterEndpoint} \
+              --kubelet-extra-args '--node-labels=customer=${CustomerName},nodegroup=${NodeGroupName},account=${AWS::AccountId}'
+
+            /opt/aws/bin/cfn-signal --exit-code $? \
+              --stack ${AWS::StackName} \
+              --resource NodeAutoScalingGroup \
+              --region ${AWS::Region}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-node"
+              - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+                Value: owned
+              - Key: customer
+                Value: !Ref CustomerName
+              - Key: hub-account
+                Value: !Ref HubAccountId
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${NodeGroupName}-volume"
+              - Key: customer
+                Value: !Ref CustomerName
+
+  # =========================================================================
+  # Auto Scaling Group
+  # =========================================================================
+
+  NodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${NodeGroupName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NodeMinSize
+      MaxSize: !Ref NodeMaxSize
+      DesiredCapacity: !Ref NodeDesiredSize
+      VPCZoneIdentifier:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${NodeGroupName}-node"
+          PropagateAtLaunch: true
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: owned
+          PropagateAtLaunch: true
+        - Key: customer
+          Value: !Ref CustomerName
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NodeDesiredSize
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+Outputs:
+  NodeGroupName:
+    Description: Node group name
+    Value: !Ref NodeGroupName
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeGroupName"
+
+  NodeRoleArn:
+    Description: Node IAM role ARN (add this to hub cluster EKS Access Entries)
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeRole"
+
+  NodeSecurityGroupId:
+    Description: Node security group ID
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeSecurityGroup"
+
+  AutoScalingGroupName:
+    Description: Auto scaling group name
+    Value: !Ref NodeAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASG"
+
+  CustomerName:
+    Description: Customer identifier
+    Value: !Ref CustomerName
+
+  PostDeploymentSteps:
+    Description: Critical steps after deployment
+    Value: !Sub |
+      IMPORTANT: You must add this node role to the hub cluster's EKS Access Entries!
+
+      In hub account (${HubAccountId}), run:
+
+      aws eks create-access-entry \
+        --cluster-name ${ClusterName} \
+        --principal-arn ${NodeRole.Arn} \
+        --type EC2_LINUX \
+        --region ap-southeast-2
+
+      aws eks associate-access-policy \
+        --cluster-name ${ClusterName} \
+        --principal-arn ${NodeRole.Arn} \
+        --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodePolicy \
+        --access-scope type=cluster \
+        --region ap-southeast-2
+
+      Then verify nodes joined:
+      kubectl get nodes --selector=customer=${CustomerName}

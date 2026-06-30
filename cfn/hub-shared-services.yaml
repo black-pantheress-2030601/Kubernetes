@@ -518,7 +518,8 @@ Resources:
           Fn::Base64: !Sub |
             [settings.kubernetes]
             cluster-name = "${ClusterName}"
-        sateAuthorityData}"
+            api-server = "${EKSCluster.Endpoint}"
+            cluster-certificate = "${EKSCluster.CertificateAuthorityData}"
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:

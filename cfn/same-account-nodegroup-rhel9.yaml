@@ -56,9 +56,9 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
 
   RHEL9AMIId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/rhel/9/latest/x86_64/release/ami-id
-    Description: RHEL 9 AMI from AWS Systems Manager Parameter Store
+    Type: AWS::EC2::Image::Id
+    Default: ami-0517760befe5a3080
+    Description: RHEL 9 AMI ID (RHEL-9.8.0_HVM-20260618-x86_64-0-Hourly2-GP3)
 
   NodeInstanceType:
     Type: String

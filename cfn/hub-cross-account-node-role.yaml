@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Hub account IAM role that cross-account nodes can assume to authenticate with EKS cluster.
+  This allows spoke account nodes to appear as hub account principals for node authentication.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+    Default: hub-shared-cluster
+
+  SpokeAccountId:
+    Type: String
+    Description: AWS account ID of the spoke account with the nodes
+    Default: "706863000784"
+
+  SpokeNodeRoleName:
+    Type: String
+    Description: Name of the IAM role in spoke account that nodes use
+    Default: cross-account-customer1-role
+
+Resources:
+
+  # Role in HUB account that spoke nodes can assume
+  CrossAccountNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cross-account-node-role"
+      Description: Role for cross-account nodes to assume when joining EKS cluster
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow spoke account node role to assume this role
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SpokeAccountId}:role/${SpokeNodeRoleName}"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Sub "eks-node-${ClusterName}"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+      Tags:
+        - Key: cluster
+          Value: !Ref ClusterName
+        - Key: purpose
+          Value: cross-account-node-authentication
+
+Outputs:
+  CrossAccountNodeRoleArn:
+    Description: ARN of the cross-account node role (add this to aws-auth ConfigMap or EKS Access Entries)
+    Value: !GetAtt CrossAccountNodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  ExternalId:
+    Description: External ID for AssumeRole calls
+    Value: !Sub "eks-node-${ClusterName}"
+
+  PostDeploymentSteps:
+    Description: Steps to complete after deployment
+    Value: !Sub |
+      1. Add this role to the hub cluster's aws-auth ConfigMap:
+
+      kubectl edit configmap aws-auth -n kube-system
+
+      Add under mapRoles:
+      - rolearn: ${CrossAccountNodeRole.Arn}
+        username: system:node:{{SessionName}}
+        groups:
+          - system:bootstrappers
+          - system:nodes
+
+      2. In the spoke account, update the node role to allow assuming this role:
+
+      aws iam put-role-policy \
+        --role-name ${SpokeNodeRoleName} \
+        --policy-name AssumeHubNodeRole \
+        --policy-document '{
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Resource": "${CrossAccountNodeRole.Arn}"
+          }]
+        }' \
+        --profile SandboxWC
+
+      3. Configure kubelet on spoke nodes to use assumed role credentials
+         (requires custom bootstrap script or webhook)

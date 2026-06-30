@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Hub account infrastructure for EKS hybrid nodes.
+  Creates Private CA, IAM Roles Anywhere, and IAM role for cross-account node authentication.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+    Default: hub-shared-cluster
+
+Resources:
+
+  # =========================================================================
+  # AWS Private Certificate Authority
+  # =========================================================================
+
+  HybridNodeCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    Properties:
+      Type: ROOT
+      KeyAlgorithm: RSA_2048
+      SigningAlgorithm: SHA256WITHRSA
+      Subject:
+        Country: AU
+        Organization: MyOrg
+        OrganizationalUnit: EKS
+        CommonName: EKS-Hybrid-Nodes-CA
+      RevocationConfiguration:
+        CrlConfiguration:
+          Enabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-hybrid-ca"
+        - Key: Purpose
+          Value: hybrid-node-certificates
+
+  # Activate the CA (required before it can issue certificates)
+  HybridNodeCACertificate:
+    Type: AWS::ACMPCA::Certificate
+    Properties:
+      CertificateAuthorityArn: !Ref HybridNodeCA
+      CertificateSigningRequest: !GetAtt HybridNodeCA.CertificateSigningRequest
+      SigningAlgorithm: SHA256WITHRSA
+      TemplateArn: arn:aws:acm-pca:::template/RootCACertificate/V1
+      Validity:
+        Type: YEARS
+        Value: 10
+
+  HybridNodeCAActivation:
+    Type: AWS::ACMPCA::CertificateAuthorityActivation
+    Properties:
+      CertificateAuthorityArn: !Ref HybridNodeCA
+      Certificate: !GetAtt HybridNodeCACertificate.Certificate
+      Status: ACTIVE
+
+  # =========================================================================
+  # IAM Role for Hybrid Nodes
+  # =========================================================================
+
+  HybridNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-hybrid-node-role"
+      Description: Role assumed by hybrid nodes via IAM Roles Anywhere
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow IAM Roles Anywhere to assume this role
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: cluster
+          Value: !Ref ClusterName
+
+  # =========================================================================
+  # IAM Roles Anywhere Resources
+  # =========================================================================
+
+  # Note: AWS::RolesAnywhere resources are not yet available in CloudFormation
+  # We'll create these via CLI after the stack is deployed
+  # Keeping this as documentation of what needs to be created:
+  #
+  # TrustAnchor:
+  #   - Name: eks-hybrid-nodes
+  #   - Source: Private CA ARN
+  #
+  # Profile:
+  #   - Name: hybrid-node-profile
+  #   - RoleArns: [HybridNodeRole]
+  #   - DurationSeconds: 3600
+
+Outputs:
+  PrivateCAArn:
+    Description: ARN of the Private CA for issuing node certificates
+    Value: !Ref HybridNodeCA
+    Export:
+      Name: !Sub "${AWS::StackName}-CA"
+
+  HybridNodeRoleArn:
+    Description: ARN of the IAM role for hybrid nodes
+    Value: !GetAtt HybridNodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  NextSteps:
+    Description: Manual steps to complete setup
+    Value: !Sub |
+      1. Create IAM Roles Anywhere Trust Anchor:
+
+      aws rolesanywhere create-trust-anchor \
+        --name ${ClusterName}-hybrid-trust \
+        --source sourceType=AWS_ACM_PCA,sourceData={acmPcaArn=${HybridNodeCA}} \
+        --enabled \
+        --region ${AWS::Region} \
+        --profile WorkloadConfig
+
+      2. Create IAM Roles Anywhere Profile:
+
+      aws rolesanywhere create-profile \
+        --name ${ClusterName}-hybrid-profile \
+        --role-arns ${HybridNodeRole.Arn} \
+        --duration-seconds 3600 \
+        --enabled \
+        --region ${AWS::Region} \
+        --profile WorkloadConfig
+
+      3. Create EKS HYBRID_LINUX Access Entry:
+
+      aws eks create-access-entry \
+        --cluster-name ${ClusterName} \
+        --principal-arn ${HybridNodeRole.Arn} \
+        --type HYBRID_LINUX \
+        --region ${AWS::Region} \
+        --profile WorkloadConfig
+
+      aws eks associate-access-policy \
+        --cluster-name ${ClusterName} \
+        --principal-arn ${HybridNodeRole.Arn} \
+        --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSWorkerNodeMinimalPolicy \
+        --access-scope type=cluster \
+        --region ${AWS::Region} \
+        --profile WorkloadConfig
+
+      4. Issue node certificate (see node configuration template)
