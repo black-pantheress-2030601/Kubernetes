@@ -1,0 +1,30 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: kyverno
+  namespace: kube-system
+spec:
+  repo: https://kyverno.github.io/kyverno
+  chart: kyverno
+  version: 3.3.4
+  targetNamespace: kyverno
+  createNamespace: true
+  valuesContent: |-
+    replicaCount: 3
+    resources:
+      limits:
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+    webhooksCleanup:
+      enabled: true
+    admissionController:
+      replicas: 3
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: admission-controller

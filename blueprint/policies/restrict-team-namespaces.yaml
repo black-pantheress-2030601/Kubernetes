@@ -1,0 +1,65 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-team-namespaces
+  annotations:
+    policies.kyverno.io/title: Restrict Teams to Their Namespaces
+    policies.kyverno.io/description: >
+      Ensures teams can only create resources in namespaces prefixed with
+      their team name. Prevents teams from deploying into system namespaces.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: block-resource-creation-in-system-namespaces
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+                - Service
+                - ConfigMap
+                - Secret
+                - Job
+                - CronJob
+              namespaces:
+                - kube-system
+                - amazon-cloudwatch
+                - networking
+                - kyverno
+                - argocd
+                - monitoring
+                - cattle-system
+                - cattle-fleet-system
+                - cert-manager
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: argocd-server
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+              - kind: ServiceAccount
+                name: rancher
+                namespace: cattle-system
+              - kind: ServiceAccount
+                name: aws-load-balancer-controller
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: cloudwatch-agent
+                namespace: amazon-cloudwatch
+          - clusterRoles:
+              - cluster-admin
+              - system:*
+      validate:
+        message: >
+          Cannot create resources in system namespace '{{request.object.metadata.namespace}}'.
+          Deploy to your team namespace instead (e.g., team-<name>).
+        deny: {}

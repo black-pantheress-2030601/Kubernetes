@@ -1,0 +1,25 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: metrics-server
+  namespace: kube-system
+spec:
+  repo: https://kubernetes-sigs.github.io/metrics-server
+  chart: metrics-server
+  version: 3.12.2
+  targetNamespace: kube-system
+  valuesContent: |-
+    replicas: 2
+    resources:
+      limits:
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: metrics-server

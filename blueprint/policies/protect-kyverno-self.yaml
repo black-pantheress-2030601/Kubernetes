@@ -1,0 +1,104 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: protect-kyverno-self
+  annotations:
+    policies.kyverno.io/title: Protect Kyverno and ArgoCD From Deletion
+    policies.kyverno.io/description: >
+      Prevents deletion of Kyverno and ArgoCD — the policy engine and GitOps
+      controller that enforce platform state. Without these, an attacker could
+      remove enforcement and then freely delete protected resources.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: block-kyverno-deletion
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - Service
+                - ServiceAccount
+                - ClusterRole
+                - ClusterRoleBinding
+              selector:
+                matchLabels:
+                  app.kubernetes.io/instance: kyverno
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+      validate:
+        message: "Kyverno components cannot be deleted. Managed by platform team via GitOps."
+        deny:
+          conditions:
+            any:
+              - key: "{{request.operation}}"
+                operator: Equals
+                value: DELETE
+
+    - name: block-argocd-deletion
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - Service
+                - ServiceAccount
+                - ClusterRole
+                - ClusterRoleBinding
+              selector:
+                matchLabels:
+                  app.kubernetes.io/instance: argocd
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+      validate:
+        message: "ArgoCD components cannot be deleted. Managed by platform team via GitOps."
+        deny:
+          conditions:
+            any:
+              - key: "{{request.operation}}"
+                operator: Equals
+                value: DELETE
+
+    - name: block-policy-deletion
+      match:
+        any:
+          - resources:
+              kinds:
+                - ClusterPolicy
+              names:
+                - protect-critical-namespaces
+                - protect-critical-workloads
+                - protect-kyverno-self
+                - restrict-team-namespaces
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+      validate:
+        message: "Platform policies cannot be deleted. Managed by platform team via GitOps."
+        deny:
+          conditions:
+            any:
+              - key: "{{request.operation}}"
+                operator: Equals
+                value: DELETE

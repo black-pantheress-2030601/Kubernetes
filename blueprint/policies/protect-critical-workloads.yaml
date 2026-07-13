@@ -1,0 +1,101 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: protect-critical-workloads
+  annotations:
+    policies.kyverno.io/title: Protect Critical Workloads
+    policies.kyverno.io/description: >
+      Prevents deletion or modification of critical addon workloads
+      (logging, networking, LB controller, policy engine).
+      Only the Fleet agent or Rancher service accounts can modify these.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: block-addon-deletion
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - DaemonSet
+                - StatefulSet
+              namespaces:
+                - kube-system
+                - amazon-cloudwatch
+                - networking
+                - kyverno
+                - argocd
+                - monitoring
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: argocd-server
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+              - kind: ServiceAccount
+                name: rancher
+                namespace: cattle-system
+              # Allow EKS addon controller (manages vpc-cni, coredns, kube-proxy)
+              - kind: User
+                name: "eks:addon-manager"
+              # Allow node-level system operations
+              - kind: User
+                name: "system:node:*"
+          - clusterRoles:
+              - system:*
+      validate:
+        message: >
+          Critical workload '{{request.object.metadata.name}}' in namespace
+          '{{request.object.metadata.namespace}}' cannot be deleted or scaled to zero.
+          Contact the platform team to make changes.
+        deny:
+          conditions:
+            any:
+              - key: "{{request.operation}}"
+                operator: Equals
+                value: DELETE
+
+    - name: block-addon-scale-to-zero
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment", "StatefulSet"]
+              namespaces:
+                - kube-system
+                - amazon-cloudwatch
+                - networking
+                - kyverno
+                - argocd
+                - monitoring
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: fleet-agent
+                namespace: cattle-fleet-system
+              - kind: ServiceAccount
+                name: rancher
+                namespace: cattle-system
+      preconditions:
+        all:
+          - key: "{{request.operation}}"
+            operator: Equals
+            value: UPDATE
+      validate:
+        message: "Critical workloads cannot be scaled to zero."
+        deny:
+          conditions:
+            any:
+              - key: "{{request.object.spec.replicas}}"
+                operator: Equals
+                value: 0

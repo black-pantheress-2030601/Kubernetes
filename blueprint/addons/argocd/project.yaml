@@ -1,0 +1,85 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  description: Platform team - manages critical addons and policies
+
+  # Only the platform project can deploy to system namespaces
+  destinations:
+    - namespace: kube-system
+      server: https://kubernetes.default.svc
+    - namespace: argocd
+      server: https://kubernetes.default.svc
+    - namespace: kyverno
+      server: https://kubernetes.default.svc
+    - namespace: amazon-cloudwatch
+      server: https://kubernetes.default.svc
+    - namespace: networking
+      server: https://kubernetes.default.svc
+    - namespace: monitoring
+      server: https://kubernetes.default.svc
+    - namespace: cert-manager
+      server: https://kubernetes.default.svc
+
+  sourceRepos:
+    - https://github.com/YOUR_ORG/eks-blueprint.git
+
+  # Allow all cluster-scoped resources (ClusterRole, ClusterPolicy, etc.)
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Allow all namespace-scoped resources in permitted namespaces
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Deny deletion of the project itself
+  orphanedResources:
+    warn: true
+---
+# Team project template - teams can only deploy to team-* namespaces
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: teams
+  namespace: argocd
+spec:
+  description: Team workloads - restricted to team namespaces only
+
+  destinations:
+    - namespace: "team-*"
+      server: https://kubernetes.default.svc
+
+  sourceRepos:
+    - https://github.com/YOUR_ORG/*
+
+  # Teams cannot deploy cluster-scoped resources
+  clusterResourceWhitelist: []
+
+  # Teams can deploy standard workload resources only
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: apps
+      kind: DaemonSet
+    - group: batch
+      kind: Job
+    - group: batch
+      kind: CronJob
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler

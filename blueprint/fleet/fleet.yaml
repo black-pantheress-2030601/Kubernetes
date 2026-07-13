@@ -1,0 +1,29 @@
+defaultNamespace: kube-system
+
+# Deploy to all clusters managed by this Fleet instance
+# Use clusterSelector to target specific clusters by label
+targets:
+  - name: all-managed-clusters
+    clusterSelector:
+      matchLabels:
+        managed-by: eks-blueprint
+
+# Helm values overrides per target (example)
+# targetCustomizations:
+#   - name: production
+#     clusterSelector:
+#       matchLabels:
+#         environment: prod
+#     helm:
+#       values:
+#         replicaCount: 3
+#   - name: dev
+#     clusterSelector:
+#       matchLabels:
+#         environment: dev
+#     helm:
+#       values:
+#         replicaCount: 1
+
+helm:
+  releaseName: blueprint-addons

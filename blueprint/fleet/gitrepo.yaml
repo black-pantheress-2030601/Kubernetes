@@ -1,0 +1,32 @@
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: eks-blueprint-addons
+  namespace: fleet-default
+spec:
+  # Point this at your actual Git repo
+  repo: https://github.com/YOUR_ORG/eks-blueprint.git
+  branch: main
+
+  # Paths within the repo to deploy
+  paths:
+    - blueprint/addons/kyverno
+    - blueprint/addons/aws-load-balancer-controller
+    - blueprint/addons/metrics-server
+    - blueprint/addons/metrics-server
+    - blueprint/policies
+
+  # Target all clusters with this label
+  targets:
+    - name: all-blueprint-clusters
+      clusterSelector:
+        matchLabels:
+          managed-by: eks-blueprint
+
+  # Poll interval
+  pollingInterval: 30s
+
+  # Force sync - if resources drift, snap them back
+  correctDrift:
+    enabled: true
+    force: true

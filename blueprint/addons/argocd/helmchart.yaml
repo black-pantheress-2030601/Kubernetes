@@ -1,0 +1,54 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: argocd
+  namespace: kube-system
+spec:
+  repo: https://argoproj.github.io/argo-helm
+  chart: argo-cd
+  version: 7.8.0
+  targetNamespace: argocd
+  createNamespace: true
+  valuesContent: |-
+    global:
+      domain: argocd.local
+
+    configs:
+      params:
+        server.insecure: true
+      cm:
+        timeout.reconciliation: 30s
+        resource.exclusions: |
+          - apiGroups: [""]
+            kinds: ["Event"]
+            clusters: ["*"]
+
+    controller:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512Mi
+        requests:
+          cpu: 250m
+          memory: 256Mi
+
+    server:
+      replicas: 2
+      resources:
+        limits:
+          memory: 256Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+
+    repoServer:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 256Mi
+
+    applicationSet:
+      replicas: 2
