@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Defaults
-REGION="${REGION:-us-east-1}"
+REGION="${REGION:-ap-southeast-2}"
 ENVIRONMENT="${ENVIRONMENT:-prod}"
 PROFILE_ARG=""
 if [ -n "$PROFILE" ]; then

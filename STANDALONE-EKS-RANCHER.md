@@ -20,16 +20,16 @@ aws cloudformation create-stack \
   --template-body file://cfn/standalone-eks-cluster.yaml \
   --parameters \
     ParameterKey=ClusterName,ParameterValue=standalone-cluster \
-    ParameterKey=VpcId,ParameterValue=vpc-0c1568ebef237d02b \
-    ParameterKey=Subnet1Id,ParameterValue=subnet-0ed5700efec6970a6 \
-    ParameterKey=Subnet2Id,ParameterValue=subnet-0b42c6093db0351cc \
-    ParameterKey=Subnet3Id,ParameterValue=subnet-0ba607bd6d77226fe \
+    ParameterKey=VpcId,ParameterValue=vpc-0940d59dd70f7f67d \
+    ParameterKey=Subnet1Id,ParameterValue=subnet-066506c4fa0e78004 \
+    ParameterKey=Subnet2Id,ParameterValue=subnet-0f697a017d3f60635 \
+    ParameterKey=Subnet3Id,ParameterValue=subnet-0d419041a14fc9eb5 \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region us-east-1
+  --region ap-southeast-2
 
 # Wait for completion (~15 minutes)
 aws cloudformation wait stack-create-complete \
-  --stack-name standalone-eks-cluster --region us-east-1
+  --stack-name standalone-eks-cluster --region ap-southeast-2
 ```
 
 ## 2. Configure kubectl
@@ -119,6 +119,6 @@ kubectl delete namespace cert-manager
 ### Delete the EKS cluster
 
 ```bash
-aws cloudformation delete-stack --stack-name standalone-eks-cluster --region us-east-1
-aws cloudformation wait stack-delete-complete --stack-name standalone-eks-cluster --region us-east-1
+aws cloudformation delete-stack --stack-name standalone-eks-cluster --region ap-southeast-2
+aws cloudformation wait stack-delete-complete --stack-name standalone-eks-cluster --region ap-southeast-2
 ```

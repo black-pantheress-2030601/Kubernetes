@@ -247,6 +247,19 @@ Resources:
   # Managed Node Group
   # =========================================================================
 
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: BottlerocketAMI
+      LaunchTemplateData:
+        InstanceType: "t3.medium"
+        MetadataOptions:
+          HttpTokens: required
+        UserData: 
+          !Sub |
+            [settings.kubernetes.node-labels]
+            "bottlerocket.aws/updater-interface-version" = "2.0.0"
+
   NodeGroup:
     Type: AWS::EKS::Nodegroup
     DependsOn:
@@ -255,8 +268,12 @@ Resources:
       - AddonKubeProxy
     Properties:
       ClusterName: !Ref EKSCluster
+      AmiType: BOTTLEROCKET_x86_64
       NodegroupName: !Sub "${ClusterName}-nodes"
       NodeRole: !GetAtt NodeRole.Arn
+      LaunchTemplate:
+        Id: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
       Subnets:
         - !Ref Subnet1Id
         - !Ref Subnet2Id

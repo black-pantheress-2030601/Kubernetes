@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Standalone EKS cluster with a managed node group.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: standalone-cluster
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.32"
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+
+  NodeMaxSize:
+    Type: Number
+    Default: 3
+
+Resources:
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+          - !Ref Subnet3Id
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub "${ClusterName}-nodes"
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets:
+        - !Ref Subnet1Id
+        - !Ref Subnet2Id
+        - !Ref Subnet3Id
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref NodeDesiredSize
+        MinSize: !Ref NodeMinSize
+        MaxSize: !Ref NodeMaxSize
+
+Outputs:
+  ClusterName:
+    Value: !Ref EKSCluster
+  ClusterEndpoint:
+    Value: !GetAtt EKSCluster.Endpoint
+  ClusterArn:
+    Value: !GetAtt EKSCluster.Arn
+  NodeRoleArn:
+    Value: !GetAtt NodeRole.Arn

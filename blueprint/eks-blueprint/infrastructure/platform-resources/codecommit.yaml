@@ -1,0 +1,45 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EKS CodeCommit and CodePipeline
+
+Parameters:
+  RepoName:
+    Type: String
+    Default: eks-blueprint
+  RepoDescription:
+    Type: String
+    Default: "Deploy code repository for EKS Blueprint"
+
+Resources:
+  CodeCommitRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepoName
+      RepositoryDescription: !Ref RepoDescription
+      Tags:
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns: 
+      - "arn:aws:iam::aws:policy/AdministratorAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Stages: 
+
+      RoleArn: 
